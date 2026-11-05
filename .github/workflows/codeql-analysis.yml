@@ -75,4 +75,4 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: codeql-javascript-sarif
-        path: ../results/*.sarif
+        path: ${{ github.workspace }}/../results/*.sarif
