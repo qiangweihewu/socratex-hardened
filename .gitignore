@@ -71,6 +71,9 @@ typings/
 # dotenv environment variables file
 .env
 .env.test
+.socratex.json
+*.pem
+*.key
 
 # parcel-bundler cache (https://parceljs.org/)
 .cache
@@ -111,4 +114,3 @@ dist
 
 # Leask
 debug.mjs
-package-lock.json
