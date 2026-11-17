@@ -33,6 +33,8 @@ const argsOptions = {
     password: { type: 'string', short: 'p', default: '' },
     port: { type: 'string', default: '0' },
     realm: { type: 'string', default: 'proxy' },
+    stealth: { type: 'boolean', default: false },
+    'secret-domain': { type: 'string', default: '' },
     repl: { type: 'boolean', short: 'r', default: false },
     token: { type: 'string', short: 'k', default: '' },
     user: { type: 'string', short: 'u', default: '' },
@@ -118,6 +120,7 @@ _socratex.user && _socratex.password && (
         return userOk && passwordOk;
     }
 );
+argv.probeResistance = argv.stealth ? { domain: argv['secret-domain'] } : false;
 if (argv.cert || argv.key) {
     if (!argv.cert || !argv.key) throw new Error('Both --cert and --key are required');
     argv.tls = { cert: await readFile(argv.cert), key: await readFile(argv.key) };

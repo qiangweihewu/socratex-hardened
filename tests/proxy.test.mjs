@@ -168,3 +168,64 @@ test('407 challenge uses a generic, configurable realm and rejects unsafe values
     assert.deepEqual(await challenge({ realm: 'corp gateway' }), ['Basic realm="corp gateway"', 'Basic realm="corp gateway"']);
     for (const realm of ['', 'a"b', 'a\\b', 'x\r\nInjected: 1', 'é', 'x'.repeat(65)]) assert.throws(() => proxy({ realm }), /realm/, JSON.stringify(realm));
 });
+const rawExchange = (port, text, { secure } = {}) => new Promise((resolve, reject) => {
+    const socket = secure ? tls.connect({ host: '127.0.0.1', port, ...secure }) : net.createConnection({ host: '127.0.0.1', port });
+    let data = ''; socket.setTimeout(3000, () => socket.destroy(new Error('Timed out')));
+    socket.on('error', reject); socket.on('data', c => data += c); socket.on('close', () => resolve(data));
+    socket.once(secure ? 'secureConnect' : 'connect', () => socket.write(text));
+});
+const normalizeDate = text => text.replace(/Date: [^\r]+/, 'Date: X');
+test('established tunnels outlive idleTimeout but still close after tunnelIdleTimeout (plain and TLS)', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'socratex-tls-'));
+    const echo = net.createServer(s => s.pipe(s)); const echoPort = await listen(echo);
+    try {
+        execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1', '-subj', '/CN=localhost', '-addext', 'subjectAltName=DNS:localhost', '-keyout', join(dir, 'key.pem'), '-out', join(dir, 'cert.pem')], { stdio: 'ignore' });
+        const cert = await readFile(join(dir, 'cert.pem')); const key = await readFile(join(dir, 'key.pem'));
+        for (const https of [false, true]) {
+            const server = proxy({ allowPrivateNetworks: true, idleTimeout: 200, tunnelIdleTimeout: 700, ...(https ? { https, tls: { key, cert } } : {}) });
+            const port = await listen(server);
+            try {
+                const socket = https ? tls.connect({ host: '127.0.0.1', port, servername: 'localhost', ca: cert }) : net.createConnection({ host: '127.0.0.1', port });
+                let data = '', closedAt = null; const started = Date.now();
+                socket.on('data', c => data += c); socket.on('error', () => {}); socket.on('close', () => closedAt = Date.now() - started);
+                await new Promise(r => socket.once(https ? 'secureConnect' : 'connect', r));
+                socket.write(`CONNECT 127.0.0.1:${echoPort} HTTP/1.1\r\nHost: x\r\nProxy-Authorization: ${auth}\r\n\r\n`);
+                await new Promise(r => setTimeout(r, 450)); // Silent for > idleTimeout.
+                assert.match(data, /200 Connection Established/); assert.equal(closedAt, null, `tls=${https} closed early`);
+                socket.write('ping'); await new Promise(r => setTimeout(r, 100));
+                assert.ok(data.endsWith('ping'), `tls=${https} echo after idleTimeout`);
+                await new Promise(r => setTimeout(r, 1200)); // Silent for > tunnelIdleTimeout.
+                assert.ok(closedAt !== null, `tls=${https} tunnel should close after tunnelIdleTimeout`);
+            } finally { await close(server); }
+        }
+    } finally { await close(echo); await rm(dir, { recursive: true, force: true }); }
+});
+test('probe resistance hides the proxy unless credentials or the secret domain are used', async () => {
+    const echo = net.createServer(s => s.pipe(s)); const echoPort = await listen(echo);
+    const server = proxy({ allowPrivateNetworks: true, probeResistance: { domain: 'Secret-Link.example' } }); const port = await listen(server);
+    const bad = 'Basic ' + Buffer.from('user:wrong').toString('base64');
+    try {
+        const unknown = normalizeDate(await rawExchange(port, 'GET /no-such-path HTTP/1.1\r\nHost: x\r\n\r\n'));
+        assert.match(unknown, /^HTTP\/1.1 404/);
+        for (const [label, text] of [
+            ['CONNECT no creds', 'CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n'],
+            ['CONNECT wrong creds', `CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\nProxy-Authorization: ${bad}\r\n\r\n`],
+            ['CONNECT malformed', 'CONNECT nonsense HTTP/1.1\r\nHost: x\r\n\r\n'],
+            ['GET absolute no creds', 'GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n'],
+        ]) assert.equal(normalizeDate(await rawExchange(port, text)), unknown, label);
+        for (const text of ['CONNECT secret-link.example:443 HTTP/1.1\r\nHost: x\r\n\r\n', 'GET http://SECRET-LINK.example/ HTTP/1.1\r\nHost: secret-link.example\r\n\r\n']) {
+            assert.match(await rawExchange(port, text), /^HTTP\/1.1 407[^]*Proxy-Authenticate: Basic realm="proxy"/);
+        }
+        assert.deepEqual(await request(port, 'http://secret-link.example/', { 'Proxy-Authorization': auth }), { status: 200, body: 'Proxy authentication OK' });
+        const tunnel = await new Promise((resolve, reject) => {
+            const socket = net.createConnection({ host: '127.0.0.1', port }); let data = '';
+            socket.on('error', reject); socket.on('data', c => { data += c; if (data.endsWith('ping')) { socket.destroy(); resolve(data); } });
+            socket.on('connect', () => socket.write(`CONNECT 127.0.0.1:${echoPort} HTTP/1.1\r\nHost: x\r\nProxy-Authorization: ${auth}\r\n\r\nping`));
+        });
+        assert.match(tunnel, /200 Connection Established/);
+    } finally { await close(server); await close(echo); }
+    // Without a secret domain, nothing ever gets a challenge.
+    const blind = proxy({ probeResistance: true }); const blindPort = await listen(blind);
+    try { assert.match(await rawExchange(blindPort, 'CONNECT example.com:443 HTTP/1.1\r\nHost: x\r\n\r\n'), /^HTTP\/1.1 404/); }
+    finally { await close(blind); }
+});

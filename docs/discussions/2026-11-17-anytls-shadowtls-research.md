@@ -1,6 +1,6 @@
 # anytls-go 与 shadow-tls 借鉴调研（2026-11-17）
 
-**状态：调研完成。** 两个 P0 已于 2026-11-17 实施（见下表“状态”说明）；P1 和 P2 未拍板。
+**状态：调研完成。** 两个 P0 和两个 P1 已于 2026-11-17 实施（`--stealth` 还待用 Shadowrocket 实测）；P2 未拍板。同日补充了 naiveproxy 和 forwardproxy 的调研（见文末）。
 
 ## 起因
 
@@ -65,8 +65,8 @@
 |---|---|---|---|---|---|
 | P0 ✅ 已完成 | 凭据、PAC token 和 console token 都改用 `crypto.timingSafeEqual`（先对两边做 SHA-256，再比较；空 secret 一律不匹配） | 我方 `main.mjs:113-115`、`lib/web.mjs:66`；对照 anytls `inbound_tcp.go:41` 的反例 | main.mjs、web.mjs | 无，补单元测试即可 | 小（约 10 行） |
 | P0 ✅ 已完成 | 去掉指纹：realm 默认改为 `proxy`，可用 `--realm` 配置（会校验，防止头部注入）；`/`、`/favicon.ico`，以及没带有效 token 的 `/console`、PAC 路由，都和未知路径返回同样的 404 | 我方 `lib/web.mjs:71-72`、`lib/socratex.mjs:149,183` | socratex.mjs、web.mjs | 确认没有客户端依赖 realm 字符串 | 小 |
-| P1 | 抗探测模式 `--stealth`（默认关闭）：没带凭据或凭据错误的请求，按普通 Web 服务器处理（404，或反代到 `--fallback` 指定的站点），**不返回 407** | shadow-tls `server.rs:282-283`；anytls `docs/protocol.md`“服务器/认证”一节（只有思路，实现缺失） | socratex.mjs | **先实测 Shadowrocket、curl 是否会主动带上 Basic 凭据**；会依赖 407 质询的客户端（如浏览器）在 stealth 模式下无法使用，需写进文档 | 中 |
-| P1 | 已建立的隧道开 TCP keepalive（`setKeepAlive(true, 30s)`），并把隧道空闲超时和握手前空闲超时拆开（新增 `tunnelIdleTimeout`，默认例如 10 分钟） | shadow-tls `util.rs:123-131`；anytls 心跳 `session.go:335-339` | socratex.mjs | 先复现“静默 60 秒以上的长连接被断开” | 小 |
+| P1 ✅ 已实现，待 Shadowrocket 实测 | 抗探测模式 `--stealth`（默认关闭；按 forwardproxy 的设计加了 `--secret-domain`）：没带凭据或凭据错误的请求，按普通 Web 服务器处理（404，或反代到 `--fallback` 指定的站点），**不返回 407** | shadow-tls `server.rs:282-283`；anytls `docs/protocol.md`“服务器/认证”一节（只有思路，实现缺失） | socratex.mjs | **先实测 Shadowrocket、curl 是否会主动带上 Basic 凭据**；会依赖 407 质询的客户端（如浏览器）在 stealth 模式下无法使用，需写进文档 | 中 |
+| P1 ✅ 已完成（已复现：静默的隧道在第 60.0 秒被断开） | 已建立的隧道开 TCP keepalive（`setKeepAlive(true, 30s)`），并把隧道空闲超时和握手前空闲超时拆开（新增 `tunnelIdleTimeout`，默认例如 10 分钟） | shadow-tls `util.rs:123-131`；anytls 心跳 `session.go:335-339` | socratex.mjs | 先复现“静默 60 秒以上的长连接被断开” | 小 |
 | P2 | HTTP/2 CONNECT（ALPN 同时声明 h2 和 http/1.1）：多条隧道共用一条 TLS 连接，这是 anytls 多路复用在标准协议里的对应做法；之后可以加 h2 帧 padding | anytls `docs/protocol.md`“复用”一节、`client.go:140-149`；padding `session.go:418-473` | socratex.mjs（新增 http2 分支） | **先确认目标客户端支持 h2 代理**（Chrome 推测支持，Shadowrocket 未知）；不支持的客户端会自动回落到 http/1.1，不受影响 | 大 |
 | P2 | SNI 分流：ClientHello 的 SNI 不是本域名（或没有 SNI，比如直接按 IP 扫描）时，原样 TCP 转发到诱饵站点 | shadow-tls `server.rs:584-662`（MIT，参照改写需署名） | socratex.mjs 的连接入口 | 确认 Shadowrocket 等客户端会发送正确的 SNI | 中 |
 
@@ -88,4 +88,26 @@
 ## 已知盲区
 - 没有读 anytls 的 `proxy/padding/padding.go` 细节、`proxy/pipe/`，以及 shadow-tls 的 `client.rs`、`helper_v2.rs`。
 - “Chrome 支持 h2 代理”“Shadowrocket 会主动带 Basic 凭据”都是推断，没有实测。
-- anytls FAQ 里提到的 naiveproxy（Caddy forwardproxy，带 probe_resistance、h2 和 padding）是和 socratex 形态最接近的参照，本次**没有调研**，建议作为下一批。
+- anytls FAQ 里提到的 naiveproxy（Caddy forwardproxy，带 probe_resistance、h2 和 padding）是和 socratex 形态最接近的参照，已在同日补充调研，见下一节。
+
+## 补充：naiveproxy 和 forwardproxy（2026-11-17）
+
+| 仓库 | 快照 | 许可证 |
+|---|---|---|
+| klzgrad/forwardproxy（Caddy 插件，naiveproxy 的服务端） | `e747854`（2026-10-23） | Apache-2.0（绿；摄入代码需加 NOTICE） |
+| klzgrad/naiveproxy（只稀疏读了文档和 `src/net/tools/naive`） | `6acbded`（2026-11-01） | Chromium BSD（绿） |
+
+- **探测抵抗**（`forwardproxy.go:258-276`，README `:122-132`）：
+  - 未认证的请求交给后面的普通网站处理，不返回 407；
+  - 只有请求秘密域名时才返回 407（`serveHiddenPage`，`:612-637`）；
+  - README `:130` 明写：会主动发送凭据的客户端不需要秘密链接。
+  - socratex 的 `--stealth` 和 `--secret-domain` 就是按这个设计实现的。
+- **凭据比较**用 `subtle.ConstantTimeCompare`（`:465`），和我们的 P0 一致。
+- **padding 是按需协商的**（naiveproxy README `:92-130`）：
+  - 双方靠 CONNECT 请求和响应里有没有 `padding` 头来判断对方是否支持，不支持的一方照常走标准 h2 CONNECT（`:126-128`）。
+  - 只对隧道建立后的前 8 次读写加 padding，每次是 3 字节头部加 0–255 字节随机填充（`:98-108`；forwardproxy `:662-760`）。
+  - CONNECT 的 HEADERS 帧也会加一个 `padding` 头（`:122`；forwardproxy `:308-320`）。
+- **P2 的修正判断**：
+  - 做 h2 CONNECT 时，顺带实现上面这套按需协商的 padding，socratex 就能兼容 **NaïveProxy 客户端**，普通的 h2 客户端也不受影响。这让 h2 这一项的价值明显上升。
+  - 前提不变：先确认目标客户端支持 h2 代理。哪些客户端支持 naive 协议，还没有调研。
+- **forwardproxy 自身的反例**：秘密页面里还写着 `Caddy Secure Web Proxy` 的 realm 和 `Hidden Proxy Page` 字样（`:612-630`），转发 HTTP 时默认会加 `Via: ... caddy` 头（`:387`、`:773`）。socratex 不照搬这些。
