@@ -302,3 +302,15 @@ test('CONNECT negotiates naive padding only for clients that ask for it', async 
     try { assert.match((await tunnel(offPort, 'padding: ~~~\r\n', Buffer.from('x'))).toString(), /^HTTP\/1.1 200 Connection Established\r\n\r\nx$/); }
     finally { await close(off); await close(echo); }
 });
+test('authenticated padding clients get a Padding header on errors too (naive preamble probe)', async () => {
+    const server = proxy({ allowPrivateNetworks: true, probeResistance: { domain: 'secret.example' } }); const port = await listen(server);
+    try {
+        const naiveHeaders = 'padding: ~~~~~~~~~~~~~~~~\r\npadding-type-request: 1, 0\r\n';
+        // NaïveProxy over HTTP/1.1 probes with `CONNECT preamble:0`; the error must keep advertising padding.
+        const preamble = await rawExchange(port, `CONNECT preamble:0 HTTP/1.1\r\nHost: preamble:0\r\nProxy-Authorization: ${auth}\r\n${naiveHeaders}\r\n`);
+        assert.match(preamble, /^HTTP\/1.1 400 Bad Request\r\n[^]*Padding: [!#$()+<>?@[\]^`{}~]{30,62}\r\n/);
+        // Ordinary clients and unauthenticated probes never see it.
+        assert.doesNotMatch(await rawExchange(port, `CONNECT preamble:0 HTTP/1.1\r\nHost: x\r\nProxy-Authorization: ${auth}\r\n\r\n`), /Padding/);
+        assert.doesNotMatch(await rawExchange(port, `CONNECT preamble:0 HTTP/1.1\r\nHost: x\r\n${naiveHeaders}\r\n`), /Padding/);
+    } finally { await close(server); }
+});
