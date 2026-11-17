@@ -71,6 +71,12 @@ No `basicAuth` callback means all proxy traffic receives 407. Library mode is pl
 
 `--stealth` makes unauthenticated or wrongly authenticated proxy requests receive the same plain 404 as an unknown path, instead of a 407 challenge, so a port scan sees an ordinary web server (design after Caddy forwardproxy `probe_resistance`). Your client must send Basic credentials **preemptively**; curl does. Add `--secret-domain=<random-name.example>` so browsers can still log in: visit `http://<random-name.example>/` through the proxy once, which is the only request that returns 407, then the browser reuses the credentials. Keep that name secret; it is only matched in the proxy request, never resolved. Library: `probeResistance: true` or `{ domain }`. Not yet verified with Shadowrocket.
 
+## NaïveProxy clients
+
+Socratex speaks the NaïveProxy padding protocol (Variant1) on HTTP/1.1 CONNECT, so NaïveProxy-compatible clients (the official `naive` client, NekoBox, husi, Exclave, v2rayN and similar) can use it as their HTTPS proxy server, for example `naive --listen=socks://127.0.0.1:1080 --proxy=https://user:pass@proxy.example.com`. Only clients that send the `padding`/`padding-type-request` headers get padded tunnels (the first 8 frames in each direction); other clients see the unchanged `200 Connection Established` stream. Library option `naivePadding: false` disables it. NaïveProxy clients send credentials preemptively, so they also work with `--stealth`. HTTP/2 multiplexing is not supported yet, so each tunnel uses its own TLS connection (resumed via session tickets).
+
+Verified with naive v154.0.8037.49-5 (macOS arm64) through a local plain-HTTP Socratex: the client logged `negotiated padding type: Variant1`, and 20/20 1 MiB downloads matched their SHA-256, with and without `--stealth`; with `naivePadding: false` it fell back to `None` and still worked. The HTTPS-to-proxy variant was not run end to end (it needs a client-trusted certificate), but the padding code path is the same.
+
 ## Performance
 
 - TLS: one secure context is built per process and reused, so certificates are not re-parsed per connection and clients can resume sessions. `main.mjs` generates session-ticket keys in memory at startup and shares them with all cluster workers; they rotate on each full restart. Prefer an ECDSA P-256 certificate: server handshakes cost far less CPU than RSA.

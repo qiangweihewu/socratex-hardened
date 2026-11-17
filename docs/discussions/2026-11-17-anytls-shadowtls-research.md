@@ -111,3 +111,48 @@
   - 做 h2 CONNECT 时，顺带实现上面这套按需协商的 padding，socratex 就能兼容 **NaïveProxy 客户端**，普通的 h2 客户端也不受影响。这让 h2 这一项的价值明显上升。
   - 前提不变：先确认目标客户端支持 h2 代理。哪些客户端支持 naive 协议，还没有调研。
 - **forwardproxy 自身的反例**：秘密页面里还写着 `Caddy Secure Web Proxy` 的 realm 和 `Hidden Proxy Page` 字样（`:612-630`），转发 HTTP 时默认会加 `Via: ... caddy` 头（`:387`、`:773`）。socratex 不照搬这些。
+
+## naiveproxy 深读（2026-11-17，快照 `6acbded`）
+
+只读了 `src/net/tools/naive/`（约 4500 行），没有读 Chromium 网络栈本身。
+
+### 关键发现
+- **padding 协商不要求 h2，HTTP/1.1 CONNECT 也可以**：
+  - 客户端：`naive_proxy_delegate.cc:42-67`、`:141-176`，只在直连和 SOCKS 时跳过协商，http/https/quic 代理都会协商。
+  - 服务端：naive 自己的服务端就是 HTTP/1.1 的 CONNECT 代理（`http_proxy_server_socket.cc:274-305` 解析 `padding` 和 `padding-type-request`；`:449-458` 回复 `HTTP/1.1 200 OK` 加上 30–62 字节的 `Padding:` 头）。
+  - **推翻上一节的判断**：padding 和 h2 是可以拆开做的。socratex 只要在 HTTP/1.1 上实现 Variant1，NaïveProxy 客户端就能连。
+- **Variant1 帧格式**（`naive_protocol.h:29-44`，`naive_padding_framer.cc` 约 70 行状态机）：
+  - 每帧是 `[长度高字节, 长度低字节, padding 长度, 数据, 零填充]`，每个方向只有前 8 帧加 padding（`naive_padding_socket.cc:20`），之后直接透传。
+  - **README 没写的细节**：服务端发出的数据小于 100 字节时，padding 取 `[255−长度, 255]`，把小包抬到接近 255 字节；其他情况在 `[0, 255]` 里均匀随机（`naive_padding_socket.cc` 的 `WritePaddingV1`）。移植以代码为准。
+  - 回复里没有 `padding-type-reply` 时，客户端按向后兼容规则把 `Padding` 头视为 Variant1（`http_proxy_server_socket.cc:280-286`，客户端解析逻辑相同）。
+- **preamble（开场请求）**：客户端在发 CONNECT 之前，先用 Chrome 的请求头 `GET https://<代理域名>/`（`preamble_getter.cc:91-93`、`:244-246`），让连接一开始看起来像在正常浏览网站。这意味着服务端的 `/` 最好是一个像样的网站；socratex 现在 `/` 返回 404，功能上不受影响，但伪装效果打折扣。
+- **超时参照**（USAGE）：
+  - `--idle-timeout` 默认 600 秒，和 socratex 的 `tunnelIdleTimeout` 一致。
+  - `--tunnel-timeout` 1800 秒后让连接“退役”，用来对付 CGNAT 网络里长连接卡死。这是 h2 连接层面的机制，做了 h2 之后才用得上。
+- **支持 naive 协议的客户端**（README `:22`、`:84-86`）：官方 naive 客户端、Exclave、husi、NekoBox（Android）、v2rayN。**名单里没有 Shadowrocket**；Shadowrocket 是否支持 naive 协议，需要另外核实。
+
+### 反例
+- 凭据比较用 `!=`，不是常量时间；校验失败时会把客户端发来的 `Proxy-Authorization` 原文写进日志（`http_proxy_server_socket.cc:362-369`）。日志默认关闭（USAGE `--log`）。
+- 服务端没有任何出站地址过滤，内网可以直达（`naive_connection.cc` 里搜不到相关检查）。
+- 认证失败直接断开连接（`:368`），因为它设计上就藏在 Caddy 或 HAProxy 后面。
+
+### 修正后的裁决（追加，未拍板）
+
+| 优先 | 事项 | 来源 | 落哪层 | 需先做什么验证 | 成本 |
+|---|---|---|---|---|---|
+| P1 ✅ 已完成，判据达标（见下方“实测记录”） | 在 HTTP/1.1 CONNECT 上兼容 naive padding Variant1：CONNECT 请求带 `padding` 头（或 `padding-type-request` 里包含 `1`）时，回复 `200` 加 `Padding:` 头，两个方向的前 8 帧做 padding 编解码；不带这个头的客户端行为完全不变 | `naive_proxy_delegate.cc:42-67,141-176`；`http_proxy_server_socket.cc:274-305,449-458`；`naive_padding_framer.cc`；`naive_padding_socket.cc` 的 `WritePaddingV1` | socratex.mjs 的 CONNECT 分支，新增约 120 行的帧编解码 | 用官方 naive 客户端实连本地 socratex，日志里出现 `negotiated padding type`，并且经它的 SOCKS 端口取页面 20 次全部正确 | 中 |
+| P2 | 诱饵站点 `--site-root`：`/` 返回一个静态网站，配合 stealth 和 naive 的 preamble | `preamble_getter.cc:91-93` | web 路由 | 防路径穿越；和 stealth 下的 404 行为保持一致 | 中小 |
+| P2 | h2 CONNECT：恢复多路复用（naive 抗流量分类的核心，README `:7`）；之后可以加连接“退役”机制 | README `:7`；USAGE `--tunnel-timeout` | 新增 http2 分支 | 确认目标客户端支持 h2 代理 | 大 |
+
+**结案不做**：Chromium 客户端的 TLS 指纹复用、QUIC/HTTP3、redir 模式和伪 DNS、SOCKS 监听。这些都是客户端功能，或者对 socratex 来说过重。
+
+**预注册判据（naive padding）**：naive 客户端通过 HTTP/1.1 能协商出 Variant1，并且 20 次取页全部正确，才合并；如果 naive 客户端在 HTTP/1.1 下无法建立隧道，就把这一项推迟到 h2 之后。
+
+### 实测记录（2026-11-17，判据达标）
+- **环境**：官方 naive v154.0.8037.49-5（macOS arm64，SHA-256 与 GitHub Release 公布的摘要一致，验证完已删除）。链路是 `curl → naive(SOCKS) → 记录字节的中继 → socratex(明文 HTTP 模式) → 本地源站或 1.1.1.1`。
+- **padding 开启**：naive 日志打出 `negotiated padding type: Variant1`；1MB 随机文件 20/20 次 SHA-256 一致；经 1.1.1.1 的 HTTPS 5/5 正常；中继记录的 25 条隧道全部是 `HTTP/1.1 200 OK` 加 `Padding:` 头。
+- **对照组**（`naivePadding: false`）：naive 协商出 `None`，数据 20/20 正确，线上没有任何 padding 字节。
+- **搭配 `--stealth`**：Variant1 协商正常，20/20 正确。naive 在第一个 CONNECT 里就主动带 `Proxy-Authorization`。
+- **未覆盖**：naive 走 HTTPS 连 socratex 的端到端测试（需要让客户端信任自签证书，就得改系统钥匙串）。padding 协商逻辑对 http 和 https 代理是同一套（`naive_proxy_delegate.cc:42-67` 不区分这两种）。
+- **preamble 不受 `/` 返回 404 影响**：`naive_proxy.cc` 的 `DoPreambleComplete` 写明 “Preamble error doesn't prevent Connect()”；而且 preamble 只在 `IsSessionCapable()` 时才发，HTTP/1.1 代理不会触发。
+- **测试过程中踩的坑**：第一版验证脚本用同步的 `execFileSync` 调 curl，卡住了同一进程里的中继和 socratex，导致 0 条隧道。改成异步调用后正常。
