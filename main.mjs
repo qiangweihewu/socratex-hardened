@@ -2,11 +2,23 @@
 
 import { callosum, manifest, ssl, storage, utilitas } from 'utilitas';
 import { consts, Socratex, web } from './index.mjs';
+import cluster from 'node:cluster';
 import { randomBytes } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { parseArgs } from 'node:util'; // https://kgrz.io/node-has-native-arg-parsing.html
 
 process.umask(0o077);
+
+// Workers inherit the primary's environment at fork time. Generate the TLS
+// session-ticket keys once here so every worker (and restarted worker) shares
+// them, and widen the libuv threadpool used by getaddrinfo before workers
+// start. Keys stay in memory only and rotate on each full restart.
+if (cluster.isPrimary) {
+    process.env.SOCRATEX_TICKET_KEYS ||= randomBytes(48).toString('base64');
+    process.env.UV_THREADPOOL_SIZE ||= '16';
+}
+const ticketKeys = process.env.SOCRATEX_TICKET_KEYS
+    ? Buffer.from(process.env.SOCRATEX_TICKET_KEYS, 'base64') : undefined;
 
 // parse args
 const argsOptions = {
@@ -20,12 +32,22 @@ const argsOptions = {
     http: { type: 'boolean', short: 't', default: false },
     password: { type: 'string', short: 'p', default: '' },
     port: { type: 'string', default: '0' },
+    realm: { type: 'string', default: 'proxy' },
+    stealth: { type: 'boolean', default: false },
+    'secret-domain': { type: 'string', default: '' },
     repl: { type: 'boolean', short: 'r', default: false },
     token: { type: 'string', short: 'k', default: '' },
     user: { type: 'string', short: 'u', default: '' },
     version: { type: 'boolean', short: 'v', default: false },
 };
 const { values } = parseArgs({ options: argsOptions });
+// Secrets may come from the environment (e.g. a systemd EnvironmentFile) so
+// they do not appear in the process list like command-line arguments do
+// (/proc/<pid>/environ is readable only by the same user and root).
+// Command-line values still take precedence.
+for (const [key, name] of [['user', 'SOCRATEX_USER'], ['password', 'SOCRATEX_PASSWORD'], ['secret-domain', 'SOCRATEX_SECRET_DOMAIN']]) {
+    if (!values[key] && process.env[name]) values[key] = process.env[name];
+}
 const argv = {
     ...values, port: ~~values.port,
     getStatus: storage.getConfig,
@@ -99,11 +121,13 @@ Object.assign(_socratex, {
 });
 _socratex.user && _socratex.password && (
     argv.basicAuth = async (username, password) => {
-        const result = username === _socratex.user
-            && password === _socratex.password;
-        return result;
+        // Evaluate both comparisons so timing does not reveal which one failed.
+        const userOk = web.safeEqual(username, _socratex.user);
+        const passwordOk = web.safeEqual(password, _socratex.password);
+        return userOk && passwordOk;
     }
 );
+argv.probeResistance = argv.stealth ? { domain: argv['secret-domain'] } : false;
 if (argv.cert || argv.key) {
     if (!argv.cert || !argv.key) throw new Error('Both --cert and --key are required');
     argv.tls = { cert: await readFile(argv.cert), key: await readFile(argv.key) };
@@ -115,7 +139,7 @@ await callosum.init({
         log('Proxy credentials configured; PAC token stored in local configuration. Console disabled.');
     },
     initWorker: async () => {
-        globalThis.socratex = new Socratex(argv);
+        globalThis.socratex = new Socratex({ ...argv, ticketKeys });
         return await new Promise((resolve, _) => {
             socratex.listen(port, argv.address, () => {
                 const { add } = getAddress(
