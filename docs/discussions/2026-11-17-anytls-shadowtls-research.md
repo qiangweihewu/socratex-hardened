@@ -165,3 +165,23 @@
   - naive 走 HTTPS 共 140 次：padding 只协商一次 `Variant1`；139 次正确，1 次是 curl exit 35（和目标站点的 TLS 握手失败，属于网络层错误，不是数据损坏）；100 次那一轮全部成功，每条连接都正常关闭。
   - 对照组 curl 走 HTTPS 代理、不加 padding：40/40。
 - **结论**：padding 搭配 HTTP/1.1 和 HTTPS 在真实链路上可用。preamble 在 HTTP/1.1 下一定会失败，这和官方 forwardproxy 的行为一致（forwardproxy 里也没有任何针对 preamble 的处理），不影响使用。
+
+### h2 CONNECT 是否要做（2026-11-17 讨论，未拍板）
+- **起因**：配置 Shadowrocket 时，它的 TLS 设置页有「HTTP2」开关（说明文字是“如果 ALPN 协商结果为 h2，则启用 HTTP/2”），ALPN 的默认占位值是 `h2,http/1.1`。Zach 问 http/1.1 和 h2 有什么区别、有没有必要支持 h2。
+- **新证据**：Shadowrocket 的 HTTPS 类型支持走 h2 代理。这部分满足了上文 P2 的前提“先确认目标客户端支持 h2 代理”。它是否真的在一条连接上复用多条隧道，还没有实测。naive 客户端默认就优先用 h2。
+- **现状**：socratex 不声明 ALPN（`lib/` 和 `main.mjs` 里没有 `ALPNProtocols`）。在线上用 `openssl s_client -alpn h2,http/1.1` 实测，结果是 `No ALPN negotiated`，客户端随后走 HTTP/1.1。
+  - Shadowrocket 的 ALPN 说明写的是：这个字段是为了降低 TLS 指纹的独特性，并提醒“如果服务器支持 HTTP/2，设置为任何包含 h2 的组合可能导致连接失败”。
+  - 所以对现在的 socratex 来说，客户端 ALPN 保持默认的 `h2,http/1.1` 就可以，这样 ClientHello 更像浏览器。HTTP2 开关保持关闭。
+  - **这是对 h2 立项的硬约束**：服务端一旦在 ALPN 里声明 h2，那些保持默认 ALPN、又没打开 HTTP2 开关的 Shadowrocket 客户端就会连不上。上线 h2 时必须二选一：要么默认关闭 h2、通过参数显式开启，要么在部署脚本输出的配置里同步要求客户端打开 HTTP2。
+- **h2 的收益**：
+  - 新隧道不用重新握手，打开新网站的首包延迟更低。跨境线路 RTT 大、TLS 握手慢时，收益最明显。
+  - 一个客户端只对服务器保持一条长连接，和浏览器访问 h2 网站的形态一致。HTTP/1.1 下一个客户端会对同一台服务器开几十条 TLS 连接，这是可以被识别的特征。
+  - ALPN 声明 h2 也和普通网站（nginx、Caddy）的默认表现一致。
+- **h2 的代价**：
+  - TCP 层的队头阻塞：丢一个包，所有隧道一起卡住。在丢包多的跨境线路上，大文件下载可能比多条 HTTP/1.1 连接还慢。
+  - 所有隧道共用一个拥塞窗口。Node `http2` 的默认流控窗口是 64KB，必须调大，否则高带宽时延积的线路上会限速。
+  - 实现量大：要新增 http2 分支，并在这条路径上重新实现认证、stealth 的 404、`Padding` 响应头、超时和 keepalive，测试也要整套补齐。纯转发时 CPU 开销也比现在的 `pipe` 高。
+- **建议（未拍板）**：暂不做。先用现有的 HTTP/1.1 版本在 Shadowrocket 和 NekoBox 上实际使用一段时间，再决定。
+- **预注册判据**：
+  - 实际使用中明显感到“打开新网站慢”，而且从客户端侧测得到 socratex 的 TLS 握手中位数 ≥300ms，才立项。
+  - 立项后，在同一台服务器上用 Caddy forwardproxy（h2）和 socratex（h1）做 A/B：分别对 20 个新域名测首字节时间，并测 1 个大文件的吞吐。h2 首字节时间中位数改善 ≥30%，并且吞吐下降不超过 10%，才合并。
