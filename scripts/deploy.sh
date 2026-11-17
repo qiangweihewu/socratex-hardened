@@ -224,7 +224,7 @@ check_port_free() {
 info "installing packages"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-PKGS=(ca-certificates curl git xz-utils iproute2 qrencode)
+PKGS=(ca-certificates curl git xz-utils iproute2 openssl qrencode)
 [ "$CERT_MODE" = certbot ] && PKGS+=(certbot)
 apt-get install -y -qq --no-install-recommends "${PKGS[@]}" >/dev/null
 
@@ -330,6 +330,10 @@ EOF
     chmod 755 "$HOOK"
     install_cert "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" "/etc/letsencrypt/live/$DOMAIN/privkey.pem"
 fi
+openssl x509 -noout -checkhost "$DOMAIN" -in "$TLS_DIR/fullchain.pem" 2>/dev/null | grep 'does match' >/dev/null \
+    || die "the certificate in $TLS_DIR does not cover $DOMAIN"
+openssl x509 -noout -checkend 604800 -in "$TLS_DIR/fullchain.pem" >/dev/null \
+    || warn "the certificate expires within 7 days"
 
 # ---------- optional network tuning ----------
 if [ "$TUNE" = 1 ]; then
