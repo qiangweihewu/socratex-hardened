@@ -42,7 +42,7 @@ A protocol check with curl (use your own trusted hostname and credentials):
 curl --proxy https://proxy.example.com:8443 --proxy-user 'myuser:password' https://example.com/
 ```
 
-PAC is optional. `/proxy.pac?token=YOUR_PAC_TOKEN` and `/wpad.dat?token=YOUR_PAC_TOKEN` return a proxy configuration; `--token` supplies the PAC download token, otherwise the existing/generated token is stored in the local configuration. A PAC token **only** authorizes the download. Clients still need Basic proxy authentication. PAC URLs can leak through browser/access logs; treat them as secrets. `/` returns a small ordinary HTTP response, unknown local routes return 404, and `/console` is disabled by default.
+PAC is optional. `/proxy.pac?token=YOUR_PAC_TOKEN` and `/wpad.dat?token=YOUR_PAC_TOKEN` return a proxy configuration; `--token` supplies the PAC download token, otherwise the existing/generated token is stored in the local configuration. A PAC token **only** authorizes the download. Clients still need Basic proxy authentication. PAC URLs can leak through browser/access logs; treat them as secrets. `/`, unknown local routes, and the PAC/console routes without a valid token all return the same plain 404, so a probe cannot tell them apart or identify the software; `/console` is disabled by default. Proxy credentials and tokens are compared in constant time. The 407 challenge uses `Basic realm="proxy"`; change it with `--realm` (library: `realm`, 1–64 printable ASCII characters, no quotes or backslashes).
 
 ## Security defaults and migration
 

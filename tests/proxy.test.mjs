@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import http from 'node:http';
 import Socratex, { isPublicAddress, connectAny, resolver } from '../lib/socratex.mjs';
+import { safeEqual } from '../lib/web.mjs';
 const auth = 'Basic ' + Buffer.from('user:pass:word').toString('base64');
 const listen = server => new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
 const close = server => new Promise(resolve => { server.closeAllConnections?.(); server.close(resolve); });
@@ -25,10 +26,14 @@ test('PAC never authorizes another socket; web routes do not issue proxy challen
     globalThis._socratex = { domain: 'localhost', token: 'test-token', address: 'PROXY localhost:8080' };
     const server = proxy(); const port = await listen(server);
     try {
-        assert.equal((await request(port, '/')).status, 200);
         assert.equal((await request(port, '/proxy.pac?token=test-token')).status, 200);
         assert.equal((await request(port, 'http://example.com/')).status, 407);
-        assert.equal((await request(port, '/console?token=test-token')).status, 401);
+        // Probe-visible routes are indistinguishable from unknown paths.
+        const unknown = await request(port, '/no-such-path');
+        assert.equal(unknown.status, 404);
+        for (const path of ['/', '/favicon.ico', '/console', '/console?token=test-token', '/proxy.pac', '/proxy.pac?token=wrong', '/wpad.dat?token=test-tokenX']) {
+            assert.deepEqual(await request(port, path), unknown, path);
+        }
         assert.equal((await request(port, 'http://127.0.0.1/', { 'Proxy-Authorization': auth })).status, 403);
         assert.equal((await request(port, 'http://[::1]/', { 'Proxy-Authorization': auth })).status, 403);
     } finally { await close(server); }
@@ -138,4 +143,28 @@ test('DNS lookups are cached and concurrent lookups coalesce', async () => {
     assert.equal(a, b); assert.equal(await resolve('localhost'), a);
     const uncached = resolver({ dnsCacheTtl: 0 });
     assert.notEqual(await uncached('localhost'), await uncached('localhost'));
+});
+test('secret comparison is exact and rejects empty or non-string secrets', () => {
+    assert.equal(safeEqual('pass:word', 'pass:word'), true);
+    for (const [a, b] of [['pass:word', 'pass:wordX'], ['', ''], ['x', ''], ['x', undefined], [null, 'x'], ['PASS:WORD', 'pass:word']]) assert.equal(safeEqual(a, b), false, `${a} vs ${b}`);
+});
+test('407 challenge uses a generic, configurable realm and rejects unsafe values', async () => {
+    const challenge = async options => {
+        const server = proxy(options); const port = await listen(server);
+        try {
+            const http407 = await new Promise((resolve, reject) => {
+                const req = http.request({ host: '127.0.0.1', port, path: 'http://example.com/', agent: false }, res => { res.resume(); resolve(res.headers['proxy-authenticate']); });
+                req.on('error', reject); req.end();
+            });
+            const connect407 = await new Promise((resolve, reject) => {
+                const socket = net.createConnection({ host: '127.0.0.1', port }); let data = '';
+                socket.on('error', reject); socket.on('data', c => data += c); socket.on('end', () => resolve(/Proxy-Authenticate: (.*)\r\n/.exec(data)?.[1]));
+                socket.on('connect', () => socket.write('CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n'));
+            });
+            return [http407, connect407];
+        } finally { await close(server); }
+    };
+    assert.deepEqual(await challenge(), ['Basic realm="proxy"', 'Basic realm="proxy"']);
+    assert.deepEqual(await challenge({ realm: 'corp gateway' }), ['Basic realm="corp gateway"', 'Basic realm="corp gateway"']);
+    for (const realm of ['', 'a"b', 'a\\b', 'x\r\nInjected: 1', 'é', 'x'.repeat(65)]) assert.throws(() => proxy({ realm }), /realm/, JSON.stringify(realm));
 });

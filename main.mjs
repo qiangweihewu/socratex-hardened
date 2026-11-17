@@ -32,6 +32,7 @@ const argsOptions = {
     http: { type: 'boolean', short: 't', default: false },
     password: { type: 'string', short: 'p', default: '' },
     port: { type: 'string', default: '0' },
+    realm: { type: 'string', default: 'proxy' },
     repl: { type: 'boolean', short: 'r', default: false },
     token: { type: 'string', short: 'k', default: '' },
     user: { type: 'string', short: 'u', default: '' },
@@ -111,9 +112,10 @@ Object.assign(_socratex, {
 });
 _socratex.user && _socratex.password && (
     argv.basicAuth = async (username, password) => {
-        const result = username === _socratex.user
-            && password === _socratex.password;
-        return result;
+        // Evaluate both comparisons so timing does not reveal which one failed.
+        const userOk = web.safeEqual(username, _socratex.user);
+        const passwordOk = web.safeEqual(password, _socratex.password);
+        return userOk && passwordOk;
     }
 );
 if (argv.cert || argv.key) {
