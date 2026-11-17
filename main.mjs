@@ -41,6 +41,13 @@ const argsOptions = {
     version: { type: 'boolean', short: 'v', default: false },
 };
 const { values } = parseArgs({ options: argsOptions });
+// Secrets may come from the environment (e.g. a systemd EnvironmentFile) so
+// they do not appear in the process list like command-line arguments do
+// (/proc/<pid>/environ is readable only by the same user and root).
+// Command-line values still take precedence.
+for (const [key, name] of [['user', 'SOCRATEX_USER'], ['password', 'SOCRATEX_PASSWORD'], ['secret-domain', 'SOCRATEX_SECRET_DOMAIN']]) {
+    if (!values[key] && process.env[name]) values[key] = process.env[name];
+}
 const argv = {
     ...values, port: ~~values.port,
     getStatus: storage.getConfig,

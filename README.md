@@ -30,6 +30,23 @@ npm test
 
 HTTP-only mode sends proxy credentials without TLS. Never use it across an untrusted network.
 
+## One-step server deployment (Debian/Ubuntu)
+
+`scripts/deploy.sh` installs Socratex as a hardened systemd service on a Debian/Ubuntu server (x64 or arm64) and prints ready-to-paste client configuration. Point the domain's DNS record at the server and open inbound TCP 443 and 80 (80 is only for Let's Encrypt issuance and renewal) first. Download the script, read it, then run it:
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/qiangweihewu/socratex-hardened/main/scripts/deploy.sh
+sudo bash deploy.sh --domain proxy.example.com --email you@example.com
+```
+
+What it does: installs official Node.js 22 (SHA-256 verified) unless Node 22+ is present, deploys the repository at `--ref` (default `main`) to `/opt/socratex`, obtains an ECDSA Let's Encrypt certificate with certbot (a deploy hook copies renewals and restarts the service), generates random credentials, and runs the service as the unprivileged `socratex` user with systemd sandboxing. Credentials live in `/etc/socratex/socratex.env` (root-only) and reach the process through the environment, so they never appear in the process list. A health check then confirms an authenticated tunnel works and an unauthenticated one is rejected.
+
+It finally prints a NaïveProxy share link (`naive+https://…`, also as a QR code) for NekoBox/husi/Exclave/v2rayN, a standard `https://user:pass@host:port` proxy URL, a Clash Meta/mihomo `proxies` entry, and the fields to enter in Shadowrocket by hand. The naive link format follows the NekoBox and v2rayN parsers; Shadowrocket has no verified import-link format, so it gets plain fields.
+
+Useful options: `--stealth` (probe resistance; also prints the browser secret link), `--port`, `--user`/`--password`, `--cert-file`/`--key-file` (bring your own certificate instead of certbot), `--tune-network` (BBR and TCP buffers), `--ref`, `--name`. Re-running updates the code and keeps credentials; `sudo bash deploy.sh --show` prints the links again; `--uninstall [--purge]` removes it. Tested on Ubuntu 24.04 (arm64, systemd container) with a custom certificate: install, re-run with `--stealth`, `--show` and `--uninstall --purge`; the certbot path has not been exercised against a real domain.
+
+`main.mjs` also reads `SOCRATEX_USER`, `SOCRATEX_PASSWORD` and `SOCRATEX_SECRET_DOMAIN` from the environment when the matching options are not given.
+
 ## Client configuration
 
 The required protocol is **HTTPS forward proxy** (TLS to the proxy), with the proxy domain, port, Basic username and password. Preserve normal server certificate validation. No VPN, MITM certificate, or destination TLS interception is required by this server.
