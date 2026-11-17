@@ -154,5 +154,14 @@
 - **对照组**（`naivePadding: false`）：naive 协商出 `None`，数据 20/20 正确，线上没有任何 padding 字节。
 - **搭配 `--stealth`**：Variant1 协商正常，20/20 正确。naive 在第一个 CONNECT 里就主动带 `Proxy-Authorization`。
 - **未覆盖**：naive 走 HTTPS 连 socratex 的端到端测试（需要让客户端信任自签证书，就得改系统钥匙串）。padding 协商逻辑对 http 和 https 代理是同一套（`naive_proxy_delegate.cc:42-67` 不区分这两种）。
-- **preamble 不受 `/` 返回 404 影响**：`naive_proxy.cc` 的 `DoPreambleComplete` 写明 “Preamble error doesn't prevent Connect()”；而且 preamble 只在 `IsSessionCapable()` 时才发，HTTP/1.1 代理不会触发。
+- **preamble 失败不影响建立隧道**：`naive_proxy.cc` 的 `DoPreambleComplete` 写明 “Preamble error doesn't prevent Connect()”。~~preamble 只在 `IsSessionCapable()` 时才发，HTTP/1.1 代理不会触发~~：**这条推断是错的**，2026-11-17 用真实服务器实测后推翻，见下一节。
 - **测试过程中踩的坑**：第一版验证脚本用同步的 `execFileSync` 调 curl，卡住了同一进程里的中继和 socratex，导致 0 条隧道。改成异步调用后正常。
+
+### 真实服务器实测（2026-11-17，hy.geshandi.vip:8443，Debian 12 x64，用 deploy.sh 部署）
+- **naive 走 HTTPS 时会发 preamble**：表现为 `CONNECT preamble:0`（NetLog 抓包确认，凭据已被 NetLog 自动去掉）。socratex 因为端口为 0 回了 400。
+- **问题**：这个 400 响应里没有 `Padding` 头，而 naive 对每台服务器只保存一份 padding 状态，于是状态在 `None` 和 `Variant1` 之间来回切换（各 16 次），20 次下载里有 2 次 SHA-256 不一致。
+- **修复**（commit `a50e520`）：客户端通过认证并声明支持 padding 之后，错误响应也带上 `Padding` 头；未认证的请求和普通客户端不受影响。
+- **修复后的结果**：
+  - naive 走 HTTPS 共 140 次：padding 只协商一次 `Variant1`；139 次正确，1 次是 curl exit 35（和目标站点的 TLS 握手失败，属于网络层错误，不是数据损坏）；100 次那一轮全部成功，每条连接都正常关闭。
+  - 对照组 curl 走 HTTPS 代理、不加 padding：40/40。
+- **结论**：padding 搭配 HTTP/1.1 和 HTTPS 在真实链路上可用。preamble 在 HTTP/1.1 下一定会失败，这和官方 forwardproxy 的行为一致（forwardproxy 里也没有任何针对 preamble 的处理），不影响使用。

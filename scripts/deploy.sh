@@ -275,7 +275,7 @@ else
     git clone -q --depth 1 --branch "$REF" "$REPO_URL" "$APP"
 fi
 COMMIT="$(git -C "$APP" rev-parse --short HEAD)"
-(cd "$APP" && PATH="$(dirname "$NODE"):$PATH" "$NPM" ci --omit=dev --ignore-scripts --no-audit --no-fund --loglevel=error)
+(cd "$APP" && PATH="$(dirname "$NODE"):$PATH" NPM_CONFIG_UPDATE_NOTIFIER=false "$NPM" ci --omit=dev --ignore-scripts --no-audit --no-fund --loglevel=error)
 "$NODE" --input-type=module -e "import('$APP/lib/padding.mjs')" >/dev/null 2>&1 \
     || warn "the deployed revision ($REF@$COMMIT) predates NaïveProxy padding support; naive links need the newer code"
 
