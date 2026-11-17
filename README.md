@@ -65,7 +65,15 @@ const proxy = new Socratex({
 proxy.listen(8080, '127.0.0.1');
 ```
 
-No `basicAuth` callback means all proxy traffic receives 407. Library mode is plaintext unless `https: true` is explicitly supplied. Optional limits: `headerTimeout`, `connectTimeout`, `idleTimeout` (milliseconds), and `maxConnections`. Configuration endpoints use the existing `_socratex` integration; library users without it can still use proxy requests.
+No `basicAuth` callback means all proxy traffic receives 407. Library mode is plaintext unless `https: true` is explicitly supplied. Optional limits: `headerTimeout`, `connectTimeout`, `idleTimeout` (milliseconds), and `maxConnections` (default 4096 per process). Performance options: `ticketKeys` (48-byte Buffer; share it across processes so TLS sessions resume on any of them), `dnsCacheTtl` (milliseconds, default 60000; `0` disables), `dnsCacheSize` (default 4096) and `connectAttemptDelay` (Happy Eyeballs stagger, default 250 ms). Configuration endpoints use the existing `_socratex` integration; library users without it can still use proxy requests.
+
+## Performance
+
+- TLS: one secure context is built per process and reused, so certificates are not re-parsed per connection and clients can resume sessions. `main.mjs` generates session-ticket keys in memory at startup and shares them with all cluster workers; they rotate on each full restart. Prefer an ECDSA P-256 certificate: server handshakes cost far less CPU than RSA.
+- DNS: lookups are cached (60 s) and concurrent lookups for one host share a single query. The private-address policy is still checked on every request, and only the checked addresses are dialed. `main.mjs` sets `UV_THREADPOOL_SIZE=16` for workers unless already set.
+- Connect: all checked addresses are tried Happy Eyeballs style (alternating IPv6/IPv4, a new attempt every 250 ms without aborting slower ones), so an unreachable IPv6 route no longer stalls the full connect timeout. `TCP_NODELAY` is enabled on both legs.
+- Host (Linux): raise `ulimit -n` above `maxConnections` × 2 × worker count, and consider `net.ipv4.tcp_congestion_control=bbr` with `net.core.default_qdisc=fq`, larger `net.core.rmem_max`/`wmem_max`, `net.core.somaxconn=4096` and `net.ipv4.tcp_slow_start_after_idle=0`.
+- For very high TLS throughput, terminate TLS in front (for example HAProxy `mode tcp`) and run Socratex with `--http --address=127.0.0.1`; never expose the HTTP-only listener publicly.
 
 ## Docker
 

@@ -2,11 +2,23 @@
 
 import { callosum, manifest, ssl, storage, utilitas } from 'utilitas';
 import { consts, Socratex, web } from './index.mjs';
+import cluster from 'node:cluster';
 import { randomBytes } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { parseArgs } from 'node:util'; // https://kgrz.io/node-has-native-arg-parsing.html
 
 process.umask(0o077);
+
+// Workers inherit the primary's environment at fork time. Generate the TLS
+// session-ticket keys once here so every worker (and restarted worker) shares
+// them, and widen the libuv threadpool used by getaddrinfo before workers
+// start. Keys stay in memory only and rotate on each full restart.
+if (cluster.isPrimary) {
+    process.env.SOCRATEX_TICKET_KEYS ||= randomBytes(48).toString('base64');
+    process.env.UV_THREADPOOL_SIZE ||= '16';
+}
+const ticketKeys = process.env.SOCRATEX_TICKET_KEYS
+    ? Buffer.from(process.env.SOCRATEX_TICKET_KEYS, 'base64') : undefined;
 
 // parse args
 const argsOptions = {
@@ -115,7 +127,7 @@ await callosum.init({
         log('Proxy credentials configured; PAC token stored in local configuration. Console disabled.');
     },
     initWorker: async () => {
-        globalThis.socratex = new Socratex(argv);
+        globalThis.socratex = new Socratex({ ...argv, ticketKeys });
         return await new Promise((resolve, _) => {
             socratex.listen(port, argv.address, () => {
                 const { add } = getAddress(

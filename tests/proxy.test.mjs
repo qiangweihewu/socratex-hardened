@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import http from 'node:http';
-import Socratex, { isPublicAddress } from '../lib/socratex.mjs';
+import Socratex, { isPublicAddress, connectAny, resolver } from '../lib/socratex.mjs';
 const auth = 'Basic ' + Buffer.from('user:pass:word').toString('base64');
 const listen = server => new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
 const close = server => new Promise(resolve => { server.closeAllConnections?.(); server.close(resolve); });
@@ -100,4 +100,42 @@ test('verified outer TLS plus Basic CONNECT works; invalid credentials get 407',
         assert.equal(await exchange(auth), 200);
         assert.equal(await exchange('Basic ' + Buffer.from('user:wrong').toString('base64')), 407);
     } finally { if (server) await close(server); if (echo) await close(echo); await rm(dir, { recursive: true, force: true }); }
+});
+test('TLS sessions resume, including across instances sharing ticketKeys', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'socratex-tls-'));
+    const servers = [];
+    try {
+        execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1', '-subj', '/CN=localhost', '-addext', 'subjectAltName=DNS:localhost', '-keyout', join(dir, 'key.pem'), '-out', join(dir, 'cert.pem')], { stdio: 'ignore' });
+        const cert = await readFile(join(dir, 'cert.pem')); const key = await readFile(join(dir, 'key.pem'));
+        const ticketKeys = Buffer.alloc(48, 7);
+        for (let i = 0; i < 2; i++) servers.push(proxy({ https: true, tls: { key, cert }, ticketKeys }));
+        const [portA, portB] = await Promise.all(servers.map(listen));
+        const handshake = (port, session) => new Promise((resolve, reject) => {
+            let ticket; const socket = tls.connect({ host: '127.0.0.1', port, servername: 'localhost', ca: cert, session });
+            socket.on('session', s => ticket = s); socket.on('error', reject);
+            socket.on('secureConnect', () => setTimeout(() => { const reused = socket.isSessionReused(); socket.destroy(); resolve({ reused, ticket }); }, 30));
+        });
+        const first = await handshake(portA);
+        assert.equal(first.reused, false); assert.ok(first.ticket);
+        assert.equal((await handshake(portA, first.ticket)).reused, true, 'same instance resumes');
+        assert.equal((await handshake(portB, first.ticket)).reused, true, 'sibling worker with shared ticketKeys resumes');
+    } finally { for (const s of servers) await close(s); await rm(dir, { recursive: true, force: true }); }
+});
+test('connectAny falls back past dead or silent addresses without waiting for the full timeout', async () => {
+    const echo = net.createServer(s => s.pipe(s)); const port = await listen(echo);
+    try {
+        const started = Date.now();
+        // ::1 refuses (echo is IPv4-only); 192.0.2.1 (TEST-NET-1) never answers.
+        const socket = await connectAny([{ address: '::1', family: 6 }, { address: '192.0.2.1', family: 4 }, { address: '127.0.0.1', family: 4 }], { port, timeout: 5000, delay: 50 });
+        assert.equal(socket.remoteAddress, '127.0.0.1'); assert.ok(Date.now() - started < 1000); socket.destroy();
+        await assert.rejects(connectAny([{ address: '::1', family: 6 }], { port, timeout: 1000 }), { status: 502 });
+        await assert.rejects(connectAny([{ address: '::1', family: 6 }], { port, timeout: 1000, localAddress: '127.0.0.1' }), { status: 502 });
+    } finally { await close(echo); }
+});
+test('DNS lookups are cached and concurrent lookups coalesce', async () => {
+    const resolve = resolver({ dnsCacheTtl: 60000 });
+    const [a, b] = await Promise.all([resolve('localhost'), resolve('LOCALHOST')]);
+    assert.equal(a, b); assert.equal(await resolve('localhost'), a);
+    const uncached = resolver({ dnsCacheTtl: 0 });
+    assert.notEqual(await uncached('localhost'), await uncached('localhost'));
 });
