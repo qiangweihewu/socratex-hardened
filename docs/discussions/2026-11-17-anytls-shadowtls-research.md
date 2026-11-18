@@ -232,3 +232,42 @@
 - **实测**（104 服务器）：
   - 已通过：旧模式迁移（凭据不变）、existing 默认路径、existing 自定义路径（文件变化后自动同步并重启服务；私钥不匹配时拒绝更新、不重启服务）、交互菜单、80 被 nginx 占用时 builtin 拒绝执行（状态不变）、builtin 和 existing 两种模式生成的配置都通过了 `sing-box check` 和 `caddy validate`。
   - **未测试**：certbot 和 builtin 的真实签发。104 的 80/443 端口属于 nginx，需要一台这两个端口空闲的服务器。
+- **补充（2026-11-18）**：
+  - 首次安装时，没给域名就在交互里询问，所以直接运行 `sudo bash deploy.sh` 就行，README 的主命令也改成了这个。
+  - 邮箱只在两种情况下询问：certbot 即将申请证书，或者 sing-box/Caddy 走内置申请（builtin）。可以直接回车跳过。socratex 的内置申请不问邮箱，因为 utilitas 把邮箱写死了。
+  - 提示语里去掉了“到期提醒”：Let's Encrypt 从 2025 年起不再发送证书到期提醒邮件。
+  - 不在终端里运行（比如 `curl | bash`）时不会提问，这时必须传 `--domain`。
+  - 已在 104 上测过：不给参数也不在终端里运行时会报错；交互模式下按 certbot、builtin、existing 三种选择，分别问了该问的问题；带着已有设置重跑时没有出现任何提问。
+- **借鉴 certbot 文章（2026-11-18，Zach 提供的 kanda.me 文章）**：
+  - **采纳 `--webroot DIR`**：80 端口已经有网站时用。调用 certbot 前，先按 Let's Encrypt 的方式（跟随跳转）自检一次，确认这个目录能从外部访问到。
+  - **采纳 `--stop-service NAME`**：在申请和每次续期时短暂停掉占用 80 端口的服务，通过 certbot 的 pre/post hook 实现，certbot 会把 hook 写进续期配置。
+  - **采纳 `renew --dry-run`**：新申请证书后，立即演练一次续期。
+  - **采纳 `certificates -d`**：按域名查找证书，支持证书名和域名不同的多域名证书。
+  - **不采纳手动 cron**：Debian/Ubuntu 的 certbot 包自带 `certbot.timer`，每天跑两次续期检查，再加 cron 是重复的。脚本改为检查这个定时器有没有在运行，没在运行就提示。
+  - **104 上的现状（没有改动）**：root 的 crontab 里有一条文章那种每月续期的 cron，和 certbot.timer 重复，但不会出问题。证书的续期配置是 standalone 模式加停/启 nginx 的 hook。
+  - **实测**：
+    - 按域名查找：部署 `cloud.geshandi.vip` 时，自动找到了 `hy.geshandi.vip` 这张证书。
+    - 参数错误时能拦下：在非 certbot 模式下用 webroot、webroot 目录不存在、服务名不存在、webroot 和 stop-service 同时使用。
+    - webroot 自检：目录没有被 80 端口的网站提供时，在调用 certbot 之前就拒绝执行，测试文件也已清理。
+    - 80 端口被占用时，报错信息给出了三种解决办法。
+    - 带着已有设置正常重跑，结果不变。
+  - **未测试**：webroot 和 stop-service 的真实签发、新申请证书后的 dry-run（同样需要一台 80 端口空闲或可控的服务器）。
+- **80 端口被占用时的交互处理（2026-11-18，Zach 拍板按方案实施）**：
+  - **识别占用者**：用 `ss -ltnp` 取进程名和 PID，再从 `/proc/PID/cgroup` 取它所属的 systemd 服务，例如 `nginx.service`。
+  - **certbot 模式的菜单**：
+    1. 只在 certbot 需要时停掉这个服务，等同 `--stop-service`；
+    2. 用网站目录完成验证，等同 `--webroot`，会先自检；
+    3. 退出，自己处理，这是默认项。
+  - **builtin 模式的菜单**：改用 certbot（接着进入上面的菜单），或退出。
+  - **不提供"杀掉进程"**：systemd 管理的进程会被重新拉起，下次续期时端口又会被占，而且占用者通常是正在服务网站的 nginx。
+  - **以下情况不提供"停服务"选项**：
+    - `docker.service`、`containerd.service`：停掉会连带所有容器；
+    - 不归 systemd 管理的进程：每次续期时没法重新启动它。
+  - 没有终端时（自动化部署），保持原来的做法：报错退出，并列出可用参数。
+  - **修过的问题**：`deploy.sh` 里第一版菜单放在 `CERT_SRC` 赋值之前，在 `set -u` 下报 unbound variable，已挪到证书路径确定之后、邮箱询问之前。
+  - **104 实测**（只选"退出"，没有停任何服务）：
+    - 两个脚本的菜单都正确识别出 nginx.service；
+    - 默认选项、非法输入、目录不存在、builtin 转 certbot 的连环菜单、无终端时的报错都符合预期；
+    - 通过菜单选了一个 nginx 没有提供的目录，自检拒绝执行，测试文件已清理；
+    - 用真实进程验证：docker-proxy 识别为容器，不提供停服务选项；普通 bash 进程识别为非 systemd 进程；
+    - 正常重跑不会弹出菜单，设置文件 md5 不变，4 个服务都在运行。

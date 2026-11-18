@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # One-step Socratex server deployment for Debian/Ubuntu (systemd, x64/arm64).
 #
-#   sudo bash deploy.sh --domain proxy.example.com [--email you@example.com]
+#   sudo bash deploy.sh                       # interactive: asks for the domain and certificate source
+#   sudo bash deploy.sh --domain proxy.example.com [--cert existing|certbot|builtin] [--email you@example.com]
 #   sudo bash deploy.sh --show                # print client links again
 #   sudo bash deploy.sh --uninstall [--purge] # remove (purge also deletes credentials)
 #
@@ -32,12 +33,12 @@ trap 'die "failed at line $LINENO: $BASH_COMMAND"' ERR
 
 usage() {
     cat <<'EOF'
-Usage: sudo bash deploy.sh --domain DOMAIN [options]
+Usage: sudo bash deploy.sh [--domain DOMAIN] [options]
        sudo bash deploy.sh --show | --uninstall [--purge]
 
 Install / update:
-  --domain DOMAIN       Public hostname whose DNS A/AAAA record points here (required on first install)
-  --email EMAIL         Let's Encrypt account e-mail (recommended for expiry notices)
+  --domain DOMAIN       Public hostname whose DNS A/AAAA record points here (asked for if missing on first install)
+  --email EMAIL         Let's Encrypt account e-mail for --cert certbot (optional; asked if missing)
   --port PORT           Proxy port (default 443)
   --user NAME           Proxy username (default: kept, else random)
   --password PASS       Proxy password, 12-128 chars of [A-Za-z0-9._~-] (default: kept, else random)
@@ -52,6 +53,10 @@ Install / update:
                                     (keeps port 80 open permanently for the HTTP-01 challenge)
   --cert-file PATH      Certificate chain for --cert existing (implies it)
   --key-file PATH       Private key for --cert existing (default: privkey.pem next to the chain)
+  --webroot DIR         --cert certbot: answer the challenge through the web server already on
+                        port 80, which serves DIR as http://DOMAIN/ (no downtime)
+  --stop-service NAME   --cert certbot: stop systemd service NAME while certbot needs port 80,
+                        at issuance and every renewal (e.g. nginx; a few seconds of downtime)
   --tune-network        Enable BBR and larger TCP buffers (/etc/sysctl.d/90-socratex.conf)
   --ref REF             Git branch or tag to deploy (default: main, or the one already deployed)
   --repo URL            Git repository (default: qiangweihewu/socratex-hardened)
@@ -65,7 +70,7 @@ EOF
 }
 
 # ---------- arguments ----------
-ACTION=install DOMAIN="" EMAIL="" PORT="" P_USER="" P_PASS="" STEALTH="" CERT_ARG="" CERT_FILE="" KEY_FILE=""
+ACTION=install DOMAIN="" EMAIL="" PORT="" P_USER="" P_PASS="" STEALTH="" CERT_ARG="" CERT_FILE="" KEY_FILE="" WEBROOT="" STOP_SVC=""
 TUNE=0 REF="" REPO_URL="" NAME="" PURGE=0
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -77,6 +82,8 @@ while [ $# -gt 0 ]; do
         --stealth) STEALTH=1 ;;
         --no-stealth) STEALTH=0 ;;
         --cert) CERT_ARG="${2:-}"; shift ;;
+        --webroot) WEBROOT="${2:-}"; shift ;;
+        --stop-service) STOP_SVC="${2:-}"; shift ;;
         --cert-file) CERT_FILE="${2:-}"; shift ;;
         --key-file) KEY_FILE="${2:-}"; shift ;;
         --tune-network) TUNE=1 ;;
@@ -193,12 +200,14 @@ esac
 command -v systemctl >/dev/null || die "systemd is required"
 command -v apt-get >/dev/null || die "only Debian/Ubuntu (apt) is supported by this script"
 DOMAIN="${DOMAIN:-$OLD_DOMAIN}"
-[ -n "$DOMAIN" ] || die "--domain is required"
+if [ -z "$DOMAIN" ] && [ -t 0 ] && [ -t 1 ]; then
+    read -r -p "Domain name whose DNS record points at this server (e.g. proxy.example.com): " DOMAIN
+fi
+[ -n "$DOMAIN" ] || die "--domain is required (or run the script in a terminal to be asked)"
 [[ "$DOMAIN" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]] || die "invalid domain: $DOMAIN"
 DOMAIN="${DOMAIN,,}"
 PORT="${PORT:-${OLD_PORT:-443}}"
 [[ "$PORT" =~ ^[0-9]+$ ]] && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || die "invalid port: $PORT"
-[ -z "$EMAIL" ] || [[ "$EMAIL" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || die "invalid e-mail: $EMAIL"
 REF="${REF:-${OLD_REF:-main}}"
 REPO_URL="${REPO_URL:-${OLD_REPO:-$REPO_URL_DEFAULT}}"
 NAME="${NAME:-${OLD_NAME:-socratex}}"
@@ -217,15 +226,21 @@ if [ "$STEALTH" = 1 ]; then SECRET_DOMAIN="${OLD_SECRET:-$(random_alnum 16 | tr 
 # certbot:  issue a Let's Encrypt certificate with certbot standalone if none exists, then as existing
 # builtin:  Socratex's own ACME client (utilitas ssl, HTTP-01 on port 80) obtains and renews it
 LE_LIVE=/etc/letsencrypt/live
+# The certbot lineage covering DOMAIN may carry another name (e.g. a multi-domain certificate).
+LE_CERT="$LE_LIVE/$DOMAIN/fullchain.pem"
+if [ ! -r "$LE_CERT" ] && command -v certbot >/dev/null; then
+    found="$(certbot certificates -d "$DOMAIN" 2>/dev/null | awk '/Certificate Path:/ {print $3; exit}' || true)"
+    if [ -n "$found" ] && [ -r "$found" ]; then LE_CERT="$found"; fi
+fi
 prev_mode="$OLD_CERT"; [ "$prev_mode" = custom ] && prev_mode=existing # pre-2026-11-18 name
 if [ -n "$CERT_ARG" ]; then CERT_MODE="$CERT_ARG"
 elif [ -n "$CERT_FILE$KEY_FILE" ]; then CERT_MODE=existing
 elif [ -n "$prev_mode" ]; then CERT_MODE="$prev_mode"
 elif [ -t 0 ] && [ -t 1 ]; then
-    default_choice=2; [ -r "$LE_LIVE/$DOMAIN/fullchain.pem" ] && default_choice=1
+    default_choice=2; [ -r "$LE_CERT" ] && default_choice=1
     echo
     echo "Certificate for $DOMAIN:"
-    echo "  1) Use an existing certificate on this server (default $LE_LIVE/$DOMAIN/fullchain.pem)"
+    echo "  1) Use an existing certificate on this server (default $LE_CERT)"
     echo "  2) Request a new Let's Encrypt certificate with certbot (needs port 80 free)"
     echo "  3) Built-in: Socratex obtains and renews it itself (keeps port 80 open)"
     read -r -p "Choose [1-3] (default $default_choice): " choice
@@ -233,11 +248,87 @@ elif [ -t 0 ] && [ -t 1 ]; then
         1) CERT_MODE=existing ;; 2) CERT_MODE=certbot ;; 3) CERT_MODE=builtin ;;
         *) die "invalid choice: $choice" ;;
     esac
-elif [ -r "$LE_LIVE/$DOMAIN/fullchain.pem" ]; then CERT_MODE=existing
+elif [ -r "$LE_CERT" ]; then CERT_MODE=existing
 else CERT_MODE=certbot
 fi
 case "$CERT_MODE" in existing|certbot|builtin) ;; *) die "--cert must be existing, certbot or builtin (got '$CERT_MODE')" ;; esac
 [ "$CERT_MODE" = existing ] || [ -z "$CERT_FILE$KEY_FILE" ] || die "--cert-file/--key-file only apply to --cert existing"
+[ -z "$WEBROOT$STOP_SVC" ] || [ "$CERT_MODE" = certbot ] || die "--webroot / --stop-service only apply to --cert certbot"
+[ -z "$WEBROOT" ] || [ -z "$STOP_SVC" ] || die "use either --webroot or --stop-service, not both"
+# ---------- port 80 for ACME ----------
+interactive() { [ -t 0 ] && [ -t 1 ]; }
+port_owner() { ss -ltnpH "sport = :$1" 2>/dev/null | awk 'NR == 1' || true; }
+# Who listens on port 80: sets P80_OWNER (raw ss line), P80_UNIT (its systemd service, if it is
+# safe to stop), P80_DESC (readable) and P80_NOTE (why it cannot be stopped for certbot).
+describe_port80() {
+    local proc="" pid=""
+    P80_OWNER="$(port_owner 80)" P80_UNIT="" P80_DESC="" P80_NOTE=""
+    [ -n "$P80_OWNER" ] || return 0
+    proc="$(printf '%s' "$P80_OWNER" | grep -o '(("[^"]*"' | head -n1 | cut -d'"' -f2 || true)"
+    pid="$(printf '%s' "$P80_OWNER" | grep -o 'pid=[0-9]*' | head -n1 | cut -d= -f2 || true)"
+    if [ -n "$pid" ]; then
+        P80_UNIT="$(grep -o 'system\.slice/[^/]*\.service' "/proc/$pid/cgroup" 2>/dev/null | head -n1 | cut -d/ -f2 || true)"
+    fi
+    P80_DESC="${proc:-an unknown process}"
+    if [ -n "$pid" ] && [ -n "$P80_UNIT" ]; then P80_DESC+=" (pid $pid, systemd service $P80_UNIT)"
+    elif [ -n "$pid" ]; then P80_DESC+=" (pid $pid)"
+    fi
+    case "$P80_UNIT" in
+        docker.service|containerd.service|podman*.service)
+            P80_NOTE="port 80 is published by a container; stopping $P80_UNIT would stop every container, so stop or move that container yourself"
+            P80_UNIT="" ;;
+        "") P80_NOTE="it is not run by a systemd service, so certbot cannot stop and restart it at each renewal" ;;
+    esac
+}
+check_webroot_arg() {
+    [[ "$WEBROOT" == /* ]] && [ -d "$WEBROOT" ] || die "--webroot must be an existing absolute directory: $WEBROOT"
+}
+# certbot standalone needs port 80 for a moment at issuance and at every renewal.
+port80_certbot_menu() {
+    local opts=() labels=() i choice
+    describe_port80
+    [ -n "$P80_OWNER" ] || return 0
+    interactive || die "certbot needs port 80 for the HTTP-01 challenge, but it is used by $P80_DESC. Use --webroot DIR (that web server's document root, no downtime), --stop-service NAME (stop it during issuance and renewals), or --cert existing / --cert builtin"
+    if [ -n "$P80_UNIT" ]; then
+        opts+=(stop); labels+=("Stop $P80_UNIT only while certbot needs port 80 (issuance and every renewal; certbot starts it again right after)")
+    fi
+    opts+=(webroot); labels+=("Let the web server on port 80 answer the challenge from its document root (no downtime; you enter the directory)")
+    opts+=(exit); labels+=("I'll free port 80 myself: exit now")
+    echo
+    echo "certbot needs port 80 for the HTTP-01 challenge, but it is used by $P80_DESC."
+    for i in "${!opts[@]}"; do echo "  $((i + 1))) ${labels[$i]}"; done
+    [ -z "$P80_NOTE" ] || echo "  (No stop option: $P80_NOTE.)"
+    read -r -p "Choose [1-${#opts[@]}] (default ${#opts[@]}): " choice
+    choice="${choice:-${#opts[@]}}"
+    [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#opts[@]}" ] || die "invalid choice: $choice"
+    case "${opts[$((choice - 1))]}" in
+        stop) STOP_SVC="$P80_UNIT"; info "certbot will stop $STOP_SVC while it needs port 80 (it remembers this for renewals)" ;;
+        webroot)
+            read -r -p "Document root that serves http://$DOMAIN/ (e.g. /var/www/html): " WEBROOT
+            check_webroot_arg ;;
+        exit) info "Port 80 is used by $P80_DESC; free it, then run the script again."; exit 1 ;;
+    esac
+}
+# Built-in ACME keeps port 80 for itself; offer certbot, which only borrows it.
+port80_builtin_menu() { # $1: why port 80 is needed
+    local choice
+    interactive || die "$1, but port 80 is used by $P80_DESC. Free it, or use --cert certbot (with --webroot / --stop-service) or --cert existing"
+    echo
+    echo "$1, but port 80 is used by $P80_DESC."
+    echo "  1) Use certbot instead: it needs port 80 only briefly, at issuance and renewals"
+    echo "  2) I'll free port 80 myself: exit now"
+    read -r -p "Choose [1-2] (default 2): " choice
+    case "${choice:-2}" in
+        1) CERT_MODE=certbot; CERT_SRC="$LE_LIVE/$DOMAIN/fullchain.pem"; KEY_SRC="$LE_LIVE/$DOMAIN/privkey.pem" ;;
+        2) info "Port 80 is used by $P80_DESC; free it, then run the script again."; exit 1 ;;
+        *) die "invalid choice: $choice" ;;
+    esac
+}
+[ -z "$WEBROOT" ] || check_webroot_arg
+if [ -n "$STOP_SVC" ]; then
+    [[ "$STOP_SVC" =~ ^[A-Za-z0-9@._-]+$ ]] && systemctl cat "$STOP_SVC" >/dev/null 2>&1 \
+        || die "--stop-service: no systemd service named '$STOP_SVC'"
+fi
 CERT_SRC="" KEY_SRC=""
 if [ "$CERT_MODE" = existing ]; then
     if [ -z "$CERT_FILE" ] && [ -z "$KEY_FILE" ] && [ -n "$OLD_CERT_FILE" ]; then
@@ -247,11 +338,11 @@ if [ "$CERT_MODE" = existing ]; then
         CERT_FILE="$TLS_DIR/fullchain.pem"; KEY_FILE="$TLS_DIR/privkey.pem" # old installs kept no source path
     fi
     if [ -z "$CERT_FILE" ] && [ -t 0 ] && [ -t 1 ]; then
-        read -r -p "Certificate chain [$LE_LIVE/$DOMAIN/fullchain.pem]: " CERT_FILE
-        CERT_FILE="${CERT_FILE:-$LE_LIVE/$DOMAIN/fullchain.pem}"
+        read -r -p "Certificate chain [$LE_CERT]: " CERT_FILE
+        CERT_FILE="${CERT_FILE:-$LE_CERT}"
         read -r -p "Private key [$(dirname "$CERT_FILE")/privkey.pem]: " KEY_FILE
     fi
-    CERT_SRC="${CERT_FILE:-$LE_LIVE/$DOMAIN/fullchain.pem}"
+    CERT_SRC="${CERT_FILE:-$LE_CERT}"
     KEY_SRC="${KEY_FILE:-$(dirname "$CERT_SRC")/privkey.pem}"
     [[ "$CERT_SRC" == /* && "$KEY_SRC" == /* ]] || die "certificate paths must be absolute"
     [ -r "$CERT_SRC" ] || die "certificate not found: $CERT_SRC (use --cert certbot or --cert builtin to get one)"
@@ -259,6 +350,20 @@ if [ "$CERT_MODE" = existing ]; then
 elif [ "$CERT_MODE" = certbot ]; then
     CERT_SRC="$LE_LIVE/$DOMAIN/fullchain.pem"; KEY_SRC="$LE_LIVE/$DOMAIN/privkey.pem"
 fi
+if [ "$CERT_MODE" = builtin ]; then
+    describe_port80
+    if [ -n "$P80_OWNER" ] && [ "$P80_UNIT" != "$SERVICE.service" ]; then # a re-run finds our own listener
+        port80_builtin_menu "--cert builtin keeps port 80 open for the ACME HTTP-01 challenge"
+    fi
+fi
+if [ "$CERT_MODE" = certbot ] && [ ! -r "$CERT_SRC" ] && [ -z "$WEBROOT$STOP_SVC" ]; then
+    port80_certbot_menu
+fi
+# Ask for an ACME contact only when a certificate is about to be requested.
+if [ -z "$EMAIL" ] && [ -t 0 ] && [ -t 1 ] && { [ "$CERT_MODE" = certbot ] && [ ! -r "$LE_LIVE/$DOMAIN/fullchain.pem" ]; }; then
+    read -r -p "E-mail for the Let's Encrypt account (optional, Enter to skip): " EMAIL
+fi
+[ -z "$EMAIL" ] || [[ "$EMAIL" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || die "invalid e-mail: $EMAIL"
 
 case "$(uname -m)" in
     x86_64|amd64) NODE_ARCH=x64 ;;
@@ -266,7 +371,6 @@ case "$(uname -m)" in
     *) die "unsupported CPU architecture: $(uname -m)" ;;
 esac
 
-port_owner() { ss -ltnpH "sport = :$1" 2>/dev/null | awk 'NR == 1' || true; }
 check_port_free() {
     local owner; owner="$(port_owner "$1")"
     [ -z "$owner" ] || [[ "$owner" == *'"node"'* && "$(systemctl is-active "$SERVICE" 2>/dev/null)" = active ]] \
@@ -284,12 +388,19 @@ apt-get install -y -qq --no-install-recommends "${PKGS[@]}" >/dev/null
 # ---------- preflight ----------
 check_port_free "$PORT"
 if [ "$CERT_MODE" = certbot ] && [ ! -r "$CERT_SRC" ]; then
-    owner="$(port_owner 80)"; [ -z "$owner" ] || die "certbot needs port 80 free for the HTTP-01 challenge, but it is used by: $owner (free it, or use --cert existing / --cert builtin)"
-fi
-if [ "$CERT_MODE" = builtin ]; then
-    owner="$(port_owner 80)"
-    [ -z "$owner" ] || [[ "$owner" == *'"node"'* && "$(systemctl is-active "$SERVICE" 2>/dev/null)" = active ]] \
-        || die "--cert builtin keeps port 80 open for the ACME HTTP-01 challenge, but it is used by: $owner"
+    if [ -n "$WEBROOT" ]; then
+        # Let's Encrypt fetches http://DOMAIN/.well-known/acme-challenge/<token> and follows
+        # redirects; check that the web server on this machine serves it from --webroot.
+        token="sx-check-$(random_alnum 24)"
+        install -d -m 755 "$WEBROOT/.well-known/acme-challenge"
+        printf '%s' "$token" > "$WEBROOT/.well-known/acme-challenge/$token"
+        chmod 644 "$WEBROOT/.well-known/acme-challenge/$token"
+        got="$(curl -skL --max-time 15 --resolve "$DOMAIN:80:127.0.0.1" --resolve "$DOMAIN:443:127.0.0.1" \
+            "http://$DOMAIN/.well-known/acme-challenge/$token" 2>/dev/null || true)"
+        rm -f "$WEBROOT/.well-known/acme-challenge/$token"
+        [ "$got" = "$token" ] || die "--webroot: http://$DOMAIN/.well-known/acme-challenge/ is not served from $WEBROOT by the web server on port 80"
+        info "webroot check passed: the web server on port 80 serves $WEBROOT"
+    fi
 fi
 resolved="$(getent ahosts "$DOMAIN" | awk '{print $1}' | sort -u | tr '\n' ' ' || true)"
 [ -n "$resolved" ] || die "$DOMAIN does not resolve; create its DNS record first"
@@ -362,10 +473,20 @@ if [ "$CERT_MODE" = builtin ]; then
 else
     if [ "$CERT_MODE" = certbot ] && [ ! -r "$CERT_SRC" ]; then
         info "requesting a Let's Encrypt certificate for $DOMAIN"
-        args=(certonly --standalone --preferred-challenges http --non-interactive --agree-tos -d "$DOMAIN")
+        args=(certonly --non-interactive --agree-tos --cert-name "$DOMAIN" -d "$DOMAIN")
+        if [ -n "$WEBROOT" ]; then
+            args+=(--webroot -w "$WEBROOT")
+        else
+            args+=(--standalone --preferred-challenges http)
+            # certbot stores the hooks in the renewal configuration, so renewals stop the service too.
+            [ -z "$STOP_SVC" ] || args+=(--pre-hook "systemctl stop $STOP_SVC" --post-hook "systemctl start $STOP_SVC")
+        fi
         if [ -n "$EMAIL" ]; then args+=(-m "$EMAIL"); else args+=(--register-unsafely-without-email); fi
         if certbot --help all 2>/dev/null | grep -- '--key-type' >/dev/null; then args+=(--key-type ecdsa); fi
         certbot "${args[@]}" || die "certbot failed: check that $DOMAIN points here and inbound TCP 80 is open (firewall / cloud security group)"
+        info "testing automatic renewal: certbot renew --dry-run (Let's Encrypt staging)"
+        if certbot renew --dry-run --cert-name "$DOMAIN" >/dev/null 2>&1; then info "certbot: renewal dry run passed"
+        else warn "certbot renew --dry-run --cert-name $DOMAIN failed: renewals will fail until that is fixed (run it to see why)"; fi
     fi
     [[ "$CERT_SRC" =~ ^/[A-Za-z0-9._/@+-]+$ && "$KEY_SRC" =~ ^/[A-Za-z0-9._/@+-]+$ ]] \
         || die "certificate paths may only contain letters, digits and . _ / @ + -"
@@ -431,6 +552,10 @@ EOF
         CERT_RENEWAL="none: replace $TLS_DIR/*.pem yourself and restart $SERVICE"
     fi
     info "certificate: $CERT_SRC ($CERT_MODE); renewals: $CERT_RENEWAL"
+    if [[ "$CERT_SRC" == /etc/letsencrypt/live/* ]] && ! systemctl is-active --quiet certbot.timer 2>/dev/null \
+        && ! systemctl is-active --quiet snap.certbot.renew.timer 2>/dev/null; then
+        warn "no active certbot renewal timer: enable it with 'systemctl enable --now certbot.timer' (no cron job needed)"
+    fi
 fi
 
 # ---------- settings ----------

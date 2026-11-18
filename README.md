@@ -32,11 +32,17 @@ HTTP-only mode sends proxy credentials without TLS. Never use it across an untru
 
 ## One-step server deployment (Debian/Ubuntu)
 
-`scripts/deploy.sh` installs Socratex as a hardened systemd service on a Debian/Ubuntu server (x64 or arm64) and prints ready-to-paste client configuration. Point the domain's DNS record at the server and open inbound TCP 443 and 80 (80 is only for Let's Encrypt issuance and renewal) first. Download the script, read it, then run it:
+`scripts/deploy.sh` installs Socratex as a hardened systemd service on a Debian/Ubuntu server (x64 or arm64) and prints ready-to-paste client configuration. Point the domain's DNS record at the server and open inbound TCP 443 (and 80 if a certificate is to be requested) first. Download the script, read it, then run it:
 
 ```sh
 curl -fsSLO https://raw.githubusercontent.com/qiangweihewu/socratex-hardened/main/scripts/deploy.sh
-sudo bash deploy.sh --domain proxy.example.com --email you@example.com
+sudo bash deploy.sh
+```
+
+Run in a terminal, it asks for the domain, the certificate source (existing files, a new certbot certificate, or the built-in ACME client; see *Certificates*) and, only when certbot is about to request a certificate, an optional e-mail. All other settings have defaults. For unattended installs pass everything as options instead; without a terminal nothing is asked and `--domain` is required:
+
+```sh
+sudo bash deploy.sh --domain proxy.example.com --cert certbot --email you@example.com
 ```
 
 What it does: installs official Node.js 22 (SHA-256 verified) unless Node 22+ is present, deploys the repository at `--ref` (default `main`) to `/opt/socratex`, sets up the certificate (see *Certificates* below), generates random credentials, and runs the service as the unprivileged `socratex` user with systemd sandboxing. Credentials live in `/etc/socratex/socratex.env` (root-only) and reach the process through the environment, so they never appear in the process list. A health check then confirms an authenticated tunnel works and an unauthenticated one is rejected.
@@ -49,17 +55,17 @@ Useful options: `--stealth` (probe resistance; also prints the browser secret li
 
 ### Certificates
 
-Both deploy scripts ask on first install (or take `--cert MODE`) where the certificate comes from. The choice is saved and reused on re-runs, and `--cert` switches it later.
+Both deploy scripts ask on first install (or take `--cert MODE`) where the certificate comes from, after asking for the domain if `--domain` was not given. The choice is saved and reused on re-runs, and `--cert` switches it later.
 
 | `--cert` | What happens | Renewal | Needs |
 |---|---|---|---|
-| `existing` | Uses files already on the server: by default `/etc/letsencrypt/live/DOMAIN/fullchain.pem` and `privkey.pem` next to it, or any `--cert-file` / `--key-file` (absolute paths, `[A-Za-z0-9._/@+-]` only) | Under `/etc/letsencrypt/live/`: a certbot deploy hook for that lineage. Elsewhere (acme.sh, a corporate CA, …): a systemd path unit that copies the files again whenever they change | Nothing extra |
-| `certbot` | Requests a Let's Encrypt ECDSA certificate with certbot standalone if the domain has none yet, then behaves like `existing` | certbot's own timer plus the deploy hook | Port 80 free during issuance |
+| `existing` | Uses files already on the server: by default `/etc/letsencrypt/live/DOMAIN/fullchain.pem` (or, if that does not exist, the certbot lineage that `certbot certificates -d DOMAIN` reports, e.g. a multi-domain certificate with another name) and `privkey.pem` next to it, or any `--cert-file` / `--key-file` (absolute paths, `[A-Za-z0-9._/@+-]` only) | Under `/etc/letsencrypt/live/`: a certbot deploy hook for that lineage. Elsewhere (acme.sh, a corporate CA, …): a systemd path unit that copies the files again whenever they change | Nothing extra |
+| `certbot` | Requests a Let's Encrypt ECDSA certificate (`--cert-name DOMAIN`) if the domain has none yet, then runs `certbot renew --dry-run` to prove renewal works, then behaves like `existing`. Port 80 already taken by a web server? `--webroot DIR` answers the challenge through it (the script first checks that `http://DOMAIN/.well-known/acme-challenge/` is served from DIR, following redirects like Let's Encrypt does); `--stop-service nginx` instead stops that service around issuance and every renewal (certbot stores the hooks) | certbot's systemd timer (`certbot.timer`, installed by the package; the script warns if it is not active, so no cron job is needed) plus the deploy hook | Port 80 free, or `--webroot` / `--stop-service` |
 | `builtin` | The proxy obtains and renews the certificate itself: Socratex's ACME client (utilitas, HTTP-01), Caddy's automatic HTTPS for naive, and sing-box's ACME certificate provider for AnyTLS. Caddy and sing-box share one certmagic store (`/var/lib/sx-proto/caddy`), so they get one certificate between them | Automatic | Port 80 free (Socratex keeps it open permanently; Caddy and sing-box only during challenges, or TLS-ALPN when naive/AnyTLS listens on 443) |
 
-Without a choice and without a terminal, `existing` is used when `/etc/letsencrypt/live/DOMAIN/fullchain.pem` exists, otherwise `certbot`. Every file-based certificate must cover the domain, and its private key must match: both are checked before anything is changed, and a failed check leaves the previous settings in place. The sync step re-checks the pair, so a half-written renewal is never installed. `builtin` refuses to start when another program holds port 80. Installs from before this option (`certbot`, or the old `custom`) carry over unchanged.
+Without a choice and without a terminal, `existing` is used when `/etc/letsencrypt/live/DOMAIN/fullchain.pem` exists, otherwise `certbot`. Every file-based certificate must cover the domain, and its private key must match: both are checked before anything is changed, and a failed check leaves the previous settings in place. The sync step re-checks the pair, so a half-written renewal is never installed. When certbot or `builtin` needs port 80 and another program holds it, the script names that program (process, PID and its systemd service). Run in a terminal, it then offers a menu. For certbot the choices are: stop that service only while certbot needs the port (the same as `--stop-service`, offered only for a systemd service and never for `docker.service` / `containerd.service`, since stopping those would stop every container), use the web server's document root (the same as `--webroot`), or exit and free the port yourself. Exit is the default. For `builtin`, which keeps the port permanently, the choices are: switch to certbot, or exit. The script never kills the program: a systemd service would be restarted anyway, and the port would be busy again at the next renewal. Without a terminal, the script stops and names the options as flags. Installs from before this option (`certbot`, or the old `custom`) carry over unchanged.
 
-Tested on the live Debian 12 server: the upgrade from the old modes, `existing` with the default Let's Encrypt path, `existing` with a custom path (the path unit copied a changed certificate and restarted the services; a mismatched key was refused and nothing was restarted), the interactive menu, and `builtin` being refused while nginx holds port 80 (nothing changed). The `builtin` configurations pass `sing-box check` and `caddy validate`. **Not yet tested**: actual ACME issuance with `certbot` and `builtin`. That server's ports 80 and 443 belong to nginx, so issuance needs a server where they are free. Socratex's built-in client registers the contact `i@DOMAIN` (hard-coded in utilitas).
+Tested on the live Debian 12 server: the upgrade from the old modes, `existing` with the default Let's Encrypt path, `existing` with a custom path (the path unit copied a changed certificate and restarted the services; a mismatched key was refused and nothing was restarted), the interactive menu, `builtin` being refused while nginx holds port 80 (nothing changed), and the port-80 menus (nginx was recognised as `nginx.service`; the exit, invalid-input, missing-directory and builtin-to-certbot paths were checked; a webroot that nginx does not serve was refused; a `docker-proxy` listener was recognised as a container and not offered for stopping). The `builtin` configurations pass `sing-box check` and `caddy validate`. **Not yet tested**: actual ACME issuance with `certbot` and `builtin`. That server's ports 80 and 443 belong to nginx, so issuance needs a server where they are free. Socratex's built-in client registers the contact `i@DOMAIN` (hard-coded in utilitas).
 
 ### AnyTLS, ShadowTLS and NaïveProxy servers
 
@@ -73,7 +79,8 @@ Tested on the live Debian 12 server: the upgrade from the old modes, `existing` 
 
 ```sh
 curl -fsSLO https://raw.githubusercontent.com/qiangweihewu/socratex-hardened/main/scripts/deploy-protocols.sh
-sudo bash deploy-protocols.sh --domain proxy.example.com --email you@example.com
+sudo bash deploy-protocols.sh                                         # asks for the domain and certificate source
+sudo bash deploy-protocols.sh --domain proxy.example.com --cert existing   # unattended
 sudo bash deploy-protocols.sh --protocols anytls,shadowtls --domain proxy.example.com   # pick a subset
 ```
 
