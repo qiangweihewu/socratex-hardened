@@ -43,8 +43,15 @@ Install / update:
   --password PASS       Proxy password, 12-128 chars of [A-Za-z0-9._~-] (default: kept, else random)
   --stealth             Probe resistance: unauthenticated requests get 404 instead of 407
   --no-stealth          Turn probe resistance off again
-  --cert-file PATH      Use an existing certificate chain instead of certbot (you renew it)
-  --key-file PATH       Private key for --cert-file
+  --cert MODE           Certificate source (asked interactively on first install):
+                          existing  use certificate files already on this server
+                                    (default /etc/letsencrypt/live/DOMAIN/fullchain.pem)
+                          certbot   request a new Let's Encrypt certificate with certbot
+                                    (needs port 80 free during issuance)
+                          builtin   Socratex's built-in ACME client obtains and renews it
+                                    (keeps port 80 open permanently for the HTTP-01 challenge)
+  --cert-file PATH      Certificate chain for --cert existing (implies it)
+  --key-file PATH       Private key for --cert existing (default: privkey.pem next to the chain)
   --tune-network        Enable BBR and larger TCP buffers (/etc/sysctl.d/90-socratex.conf)
   --ref REF             Git branch or tag to deploy (default: main, or the one already deployed)
   --repo URL            Git repository (default: qiangweihewu/socratex-hardened)
@@ -58,7 +65,7 @@ EOF
 }
 
 # ---------- arguments ----------
-ACTION=install DOMAIN="" EMAIL="" PORT="" P_USER="" P_PASS="" STEALTH="" CERT_FILE="" KEY_FILE=""
+ACTION=install DOMAIN="" EMAIL="" PORT="" P_USER="" P_PASS="" STEALTH="" CERT_ARG="" CERT_FILE="" KEY_FILE=""
 TUNE=0 REF="" REPO_URL="" NAME="" PURGE=0
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -69,6 +76,7 @@ while [ $# -gt 0 ]; do
         --password) P_PASS="${2:-}"; shift ;;
         --stealth) STEALTH=1 ;;
         --no-stealth) STEALTH=0 ;;
+        --cert) CERT_ARG="${2:-}"; shift ;;
         --cert-file) CERT_FILE="${2:-}"; shift ;;
         --key-file) KEY_FILE="${2:-}"; shift ;;
         --tune-network) TUNE=1 ;;
@@ -98,10 +106,12 @@ load_env() {
             SOCRATEX_SECRET_DOMAIN) OLD_SECRET="$value" ;; DEPLOY_STEALTH) OLD_STEALTH="$value" ;;
             DEPLOY_REF) OLD_REF="$value" ;; DEPLOY_REPO) OLD_REPO="$value" ;;
             DEPLOY_NAME) OLD_NAME="$value" ;; DEPLOY_CERT) OLD_CERT="$value" ;;
+            DEPLOY_CERT_FILE) OLD_CERT_FILE="$value" ;; DEPLOY_KEY_FILE) OLD_KEY_FILE="$value" ;;
         esac
     done < "$ENV_FILE"
 }
 OLD_USER="" OLD_PASS="" OLD_DOMAIN="" OLD_PORT="" OLD_SECRET="" OLD_STEALTH="" OLD_REF="" OLD_REPO="" OLD_NAME="" OLD_CERT=""
+OLD_CERT_FILE="" OLD_KEY_FILE=""
 load_env
 
 # ---------- client links ----------
@@ -157,7 +167,8 @@ show_links() {
 uninstall() {
     info "stopping and removing the $SERVICE service"
     systemctl disable --now "$SERVICE" 2>/dev/null || true
-    rm -f "$UNIT" "$HOOK"
+    systemctl disable --now "$SERVICE-cert.path" >/dev/null 2>&1 || true
+    rm -f "$UNIT" "$HOOK" "$ETC/cert-sync.sh" "/etc/systemd/system/$SERVICE-cert.path" "/etc/systemd/system/$SERVICE-cert.service"
     systemctl daemon-reload
     rm -rf "$BASE"
     if [ "$PURGE" -eq 1 ]; then
@@ -200,12 +211,53 @@ P_PASS="${P_PASS:-${OLD_PASS:-$(random_alnum 32)}}"
 STEALTH="${STEALTH:-${OLD_STEALTH:-0}}"
 SECRET_DOMAIN=""
 if [ "$STEALTH" = 1 ]; then SECRET_DOMAIN="${OLD_SECRET:-$(random_alnum 16 | tr 'A-Z' 'a-z').example}"; fi
-if [ -n "$CERT_FILE$KEY_FILE" ]; then
-    [ -r "$CERT_FILE" ] && [ -r "$KEY_FILE" ] || die "--cert-file and --key-file must both be readable files"
-    CERT_MODE=custom
-else
-    CERT_MODE="${OLD_CERT:-certbot}"
-    [ "$CERT_MODE" != custom ] || [ -s "$TLS_DIR/fullchain.pem" ] || die "previous install used custom certificates; pass --cert-file/--key-file again"
+# ---------- certificate mode ----------
+# existing: copy chain/key from files already on the server (renewals are picked up by a
+#           certbot deploy hook for /etc/letsencrypt/live/*, otherwise by a systemd path unit)
+# certbot:  issue a Let's Encrypt certificate with certbot standalone if none exists, then as existing
+# builtin:  Socratex's own ACME client (utilitas ssl, HTTP-01 on port 80) obtains and renews it
+LE_LIVE=/etc/letsencrypt/live
+prev_mode="$OLD_CERT"; [ "$prev_mode" = custom ] && prev_mode=existing # pre-2026-11-18 name
+if [ -n "$CERT_ARG" ]; then CERT_MODE="$CERT_ARG"
+elif [ -n "$CERT_FILE$KEY_FILE" ]; then CERT_MODE=existing
+elif [ -n "$prev_mode" ]; then CERT_MODE="$prev_mode"
+elif [ -t 0 ] && [ -t 1 ]; then
+    default_choice=2; [ -r "$LE_LIVE/$DOMAIN/fullchain.pem" ] && default_choice=1
+    echo
+    echo "Certificate for $DOMAIN:"
+    echo "  1) Use an existing certificate on this server (default $LE_LIVE/$DOMAIN/fullchain.pem)"
+    echo "  2) Request a new Let's Encrypt certificate with certbot (needs port 80 free)"
+    echo "  3) Built-in: Socratex obtains and renews it itself (keeps port 80 open)"
+    read -r -p "Choose [1-3] (default $default_choice): " choice
+    case "${choice:-$default_choice}" in
+        1) CERT_MODE=existing ;; 2) CERT_MODE=certbot ;; 3) CERT_MODE=builtin ;;
+        *) die "invalid choice: $choice" ;;
+    esac
+elif [ -r "$LE_LIVE/$DOMAIN/fullchain.pem" ]; then CERT_MODE=existing
+else CERT_MODE=certbot
+fi
+case "$CERT_MODE" in existing|certbot|builtin) ;; *) die "--cert must be existing, certbot or builtin (got '$CERT_MODE')" ;; esac
+[ "$CERT_MODE" = existing ] || [ -z "$CERT_FILE$KEY_FILE" ] || die "--cert-file/--key-file only apply to --cert existing"
+CERT_SRC="" KEY_SRC=""
+if [ "$CERT_MODE" = existing ]; then
+    if [ -z "$CERT_FILE" ] && [ -z "$KEY_FILE" ] && [ -n "$OLD_CERT_FILE" ]; then
+        CERT_FILE="$OLD_CERT_FILE"; KEY_FILE="$OLD_KEY_FILE"
+    fi
+    if [ -z "$CERT_FILE" ] && [ "$OLD_CERT" = custom ]; then
+        CERT_FILE="$TLS_DIR/fullchain.pem"; KEY_FILE="$TLS_DIR/privkey.pem" # old installs kept no source path
+    fi
+    if [ -z "$CERT_FILE" ] && [ -t 0 ] && [ -t 1 ]; then
+        read -r -p "Certificate chain [$LE_LIVE/$DOMAIN/fullchain.pem]: " CERT_FILE
+        CERT_FILE="${CERT_FILE:-$LE_LIVE/$DOMAIN/fullchain.pem}"
+        read -r -p "Private key [$(dirname "$CERT_FILE")/privkey.pem]: " KEY_FILE
+    fi
+    CERT_SRC="${CERT_FILE:-$LE_LIVE/$DOMAIN/fullchain.pem}"
+    KEY_SRC="${KEY_FILE:-$(dirname "$CERT_SRC")/privkey.pem}"
+    [[ "$CERT_SRC" == /* && "$KEY_SRC" == /* ]] || die "certificate paths must be absolute"
+    [ -r "$CERT_SRC" ] || die "certificate not found: $CERT_SRC (use --cert certbot or --cert builtin to get one)"
+    [ -r "$KEY_SRC" ] || die "private key not found: $KEY_SRC (pass --key-file)"
+elif [ "$CERT_MODE" = certbot ]; then
+    CERT_SRC="$LE_LIVE/$DOMAIN/fullchain.pem"; KEY_SRC="$LE_LIVE/$DOMAIN/privkey.pem"
 fi
 
 case "$(uname -m)" in
@@ -231,8 +283,13 @@ apt-get install -y -qq --no-install-recommends "${PKGS[@]}" >/dev/null
 
 # ---------- preflight ----------
 check_port_free "$PORT"
-if [ "$CERT_MODE" = certbot ] && [ ! -d "/etc/letsencrypt/live/$DOMAIN" ]; then
-    owner="$(port_owner 80)"; [ -z "$owner" ] || die "certbot needs port 80 free for the HTTP-01 challenge, but it is used by: $owner (free it, or use --cert-file/--key-file)"
+if [ "$CERT_MODE" = certbot ] && [ ! -r "$CERT_SRC" ]; then
+    owner="$(port_owner 80)"; [ -z "$owner" ] || die "certbot needs port 80 free for the HTTP-01 challenge, but it is used by: $owner (free it, or use --cert existing / --cert builtin)"
+fi
+if [ "$CERT_MODE" = builtin ]; then
+    owner="$(port_owner 80)"
+    [ -z "$owner" ] || [[ "$owner" == *'"node"'* && "$(systemctl is-active "$SERVICE" 2>/dev/null)" = active ]] \
+        || die "--cert builtin keeps port 80 open for the ACME HTTP-01 challenge, but it is used by: $owner"
 fi
 resolved="$(getent ahosts "$DOMAIN" | awk '{print $1}' | sort -u | tr '\n' ' ' || true)"
 [ -n "$resolved" ] || die "$DOMAIN does not resolve; create its DNS record first"
@@ -286,6 +343,97 @@ install -d -m 700 -o "$SERVICE" -g "$SERVICE" "$STATE"
 install -d -m 755 "$ETC"
 install -d -m 750 -o root -g "$SERVICE" "$TLS_DIR"
 EXTRA_ARGS=""; [ "$STEALTH" = 1 ] && EXTRA_ARGS="--stealth"
+# Without --cert/--key Socratex runs its built-in ACME client (lib: utilitas ssl).
+TLS_ARGS="--cert=$TLS_DIR/fullchain.pem --key=$TLS_DIR/privkey.pem"; [ "$CERT_MODE" = builtin ] && TLS_ARGS=""
+
+# ---------- certificate ----------
+SYNC="$ETC/cert-sync.sh"
+CERT_UNIT="$SERVICE-cert"
+key_fingerprint() { openssl pkey -in "$1" -pubout -outform DER 2>/dev/null | sha256sum; }
+cert_fingerprint() { openssl x509 -noout -pubkey -in "$1" 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum; }
+remove_cert_sync() {
+    rm -f "$HOOK" "$SYNC"
+    systemctl disable --now "$CERT_UNIT.path" >/dev/null 2>&1 || true
+    rm -f "/etc/systemd/system/$CERT_UNIT.path" "/etc/systemd/system/$CERT_UNIT.service"
+}
+remove_cert_sync
+if [ "$CERT_MODE" = builtin ]; then
+    info "certificate: Socratex's built-in ACME client will obtain and renew it (HTTP-01 on port 80)"
+else
+    if [ "$CERT_MODE" = certbot ] && [ ! -r "$CERT_SRC" ]; then
+        info "requesting a Let's Encrypt certificate for $DOMAIN"
+        args=(certonly --standalone --preferred-challenges http --non-interactive --agree-tos -d "$DOMAIN")
+        if [ -n "$EMAIL" ]; then args+=(-m "$EMAIL"); else args+=(--register-unsafely-without-email); fi
+        if certbot --help all 2>/dev/null | grep -- '--key-type' >/dev/null; then args+=(--key-type ecdsa); fi
+        certbot "${args[@]}" || die "certbot failed: check that $DOMAIN points here and inbound TCP 80 is open (firewall / cloud security group)"
+    fi
+    [[ "$CERT_SRC" =~ ^/[A-Za-z0-9._/@+-]+$ && "$KEY_SRC" =~ ^/[A-Za-z0-9._/@+-]+$ ]] \
+        || die "certificate paths may only contain letters, digits and . _ / @ + -"
+    openssl x509 -noout -checkhost "$DOMAIN" -in "$CERT_SRC" 2>/dev/null | grep 'does match' >/dev/null \
+        || die "$CERT_SRC is not a certificate for $DOMAIN"
+    [ "$(cert_fingerprint "$CERT_SRC")" = "$(key_fingerprint "$KEY_SRC")" ] || die "$KEY_SRC is not the private key of $CERT_SRC"
+    openssl x509 -noout -checkend 604800 -in "$CERT_SRC" >/dev/null || warn "the certificate expires within 7 days"
+    if [ "$CERT_SRC" != "$TLS_DIR/fullchain.pem" ]; then
+        # One script copies the pair into place and restarts the service. It runs now,
+        # from certbot after renewals of a /etc/letsencrypt/live lineage, or from a path unit.
+        cat > "$SYNC" <<EOF
+#!/bin/sh
+# Installed by socratex deploy.sh: copy the certificate into place and restart.
+set -e
+[ "\${1:-}" = --delay ] && sleep 5  # path unit: let the writer finish both files
+cert=$CERT_SRC key=$KEY_SRC
+a=\$(openssl x509 -noout -pubkey -in "\$cert" | openssl pkey -pubin -outform DER | sha256sum)
+b=\$(openssl pkey -in "\$key" -pubout -outform DER | sha256sum)
+[ "\$a" = "\$b" ] || { echo "\$cert and \$key do not match; not updating" >&2; exit 1; }
+install -m 640 -o root -g $SERVICE "\$cert" $TLS_DIR/fullchain.pem
+install -m 640 -o root -g $SERVICE "\$key" $TLS_DIR/privkey.pem
+[ "\${1:-}" = --no-restart ] && exit 0
+if systemctl is-enabled --quiet $SERVICE 2>/dev/null; then systemctl restart $SERVICE; fi
+EOF
+        chmod 700 "$SYNC"
+        "$SYNC" --no-restart
+        if [[ "$CERT_SRC" =~ ^/etc/letsencrypt/live/([^/]+)/ ]]; then
+            lineage="/etc/letsencrypt/live/${BASH_REMATCH[1]}"
+            mkdir -p "$(dirname "$HOOK")"
+            cat > "$HOOK" <<EOF
+#!/bin/sh
+# Installed by socratex deploy.sh: pick up renewals of $lineage.
+[ "\$RENEWED_LINEAGE" = "$lineage" ] || exit 0
+exec $SYNC
+EOF
+            chmod 755 "$HOOK"
+            CERT_RENEWAL="certbot deploy hook for $lineage"
+        else
+            cat > "/etc/systemd/system/$CERT_UNIT.service" <<EOF
+[Unit]
+Description=Socratex: install the renewed certificate
+
+[Service]
+Type=oneshot
+ExecStart=$SYNC --delay
+EOF
+            cat > "/etc/systemd/system/$CERT_UNIT.path" <<EOF
+[Unit]
+Description=Socratex: watch $CERT_SRC for renewals
+
+[Path]
+PathChanged=$CERT_SRC
+PathChanged=$KEY_SRC
+
+[Install]
+WantedBy=multi-user.target
+EOF
+            systemctl daemon-reload
+            systemctl enable -q --now "$CERT_UNIT.path"
+            CERT_RENEWAL="systemd path unit $CERT_UNIT.path copies the files again when they change"
+        fi
+    else
+        CERT_RENEWAL="none: replace $TLS_DIR/*.pem yourself and restart $SERVICE"
+    fi
+    info "certificate: $CERT_SRC ($CERT_MODE); renewals: $CERT_RENEWAL"
+fi
+
+# ---------- settings ----------
 tmp_env="$(mktemp)"
 cat > "$tmp_env" <<EOF
 SOCRATEX_USER=$P_USER
@@ -294,47 +442,16 @@ SOCRATEX_DOMAIN=$DOMAIN
 SOCRATEX_PORT=$PORT
 SOCRATEX_SECRET_DOMAIN=$SECRET_DOMAIN
 SOCRATEX_EXTRA_ARGS=$EXTRA_ARGS
+SOCRATEX_TLS_ARGS=$TLS_ARGS
 DEPLOY_STEALTH=$STEALTH
 DEPLOY_REF=$REF
 DEPLOY_REPO=$REPO_URL
 DEPLOY_NAME=$NAME
 DEPLOY_CERT=$CERT_MODE
+DEPLOY_CERT_FILE=$([ "$CERT_MODE" = existing ] && echo "$CERT_SRC" || true)
+DEPLOY_KEY_FILE=$([ "$CERT_MODE" = existing ] && echo "$KEY_SRC" || true)
 EOF
 install -m 600 -o root -g root "$tmp_env" "$ENV_FILE"; rm -f "$tmp_env"
-
-# ---------- certificate ----------
-install_cert() { # $1 chain, $2 key
-    install -m 640 -o root -g "$SERVICE" "$1" "$TLS_DIR/fullchain.pem"
-    install -m 640 -o root -g "$SERVICE" "$2" "$TLS_DIR/privkey.pem"
-}
-if [ "$CERT_MODE" = custom ]; then
-    [ -z "$CERT_FILE" ] || install_cert "$CERT_FILE" "$KEY_FILE"
-    warn "custom certificate: you must renew it and re-run with --cert-file/--key-file (or copy into $TLS_DIR and restart $SERVICE)"
-else
-    if [ ! -d "/etc/letsencrypt/live/$DOMAIN" ]; then
-        info "requesting a Let's Encrypt certificate for $DOMAIN"
-        args=(certonly --standalone --preferred-challenges http --non-interactive --agree-tos -d "$DOMAIN")
-        if [ -n "$EMAIL" ]; then args+=(-m "$EMAIL"); else args+=(--register-unsafely-without-email); fi
-        if certbot --help all 2>/dev/null | grep -- '--key-type' >/dev/null; then args+=(--key-type ecdsa); fi
-        certbot "${args[@]}" || die "certbot failed: check that $DOMAIN points here and inbound TCP 80 is open (firewall / cloud security group)"
-    fi
-    mkdir -p "$(dirname "$HOOK")"
-    cat > "$HOOK" <<EOF
-#!/bin/sh
-# Installed by socratex deploy.sh: copy renewed certificates and restart.
-set -e
-[ "\$RENEWED_LINEAGE" = "/etc/letsencrypt/live/$DOMAIN" ] || exit 0
-install -m 640 -o root -g $SERVICE "\$RENEWED_LINEAGE/fullchain.pem" $TLS_DIR/fullchain.pem
-install -m 640 -o root -g $SERVICE "\$RENEWED_LINEAGE/privkey.pem" $TLS_DIR/privkey.pem
-systemctl restart $SERVICE
-EOF
-    chmod 755 "$HOOK"
-    install_cert "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" "/etc/letsencrypt/live/$DOMAIN/privkey.pem"
-fi
-openssl x509 -noout -checkhost "$DOMAIN" -in "$TLS_DIR/fullchain.pem" 2>/dev/null | grep 'does match' >/dev/null \
-    || die "the certificate in $TLS_DIR does not cover $DOMAIN"
-openssl x509 -noout -checkend 604800 -in "$TLS_DIR/fullchain.pem" >/dev/null \
-    || warn "the certificate expires within 7 days"
 
 # ---------- optional network tuning ----------
 if [ "$TUNE" = 1 ]; then
@@ -368,7 +485,7 @@ Group=$SERVICE
 EnvironmentFile=$ENV_FILE
 Environment=HOME=$STATE
 WorkingDirectory=$APP
-ExecStart=$NODE main.mjs --domain=\${SOCRATEX_DOMAIN} --port=\${SOCRATEX_PORT} --cert=$TLS_DIR/fullchain.pem --key=$TLS_DIR/privkey.pem \$SOCRATEX_EXTRA_ARGS
+ExecStart=$NODE main.mjs --domain=\${SOCRATEX_DOMAIN} --port=\${SOCRATEX_PORT} \$SOCRATEX_TLS_ARGS \$SOCRATEX_EXTRA_ARGS
 Restart=on-failure
 RestartSec=3
 LimitNOFILE=65535
@@ -395,7 +512,7 @@ systemctl enable -q "$SERVICE"
 systemctl restart "$SERVICE"
 
 # ---------- firewall ----------
-FW_PORTS=("$PORT/tcp"); [ "$CERT_MODE" = certbot ] && FW_PORTS+=(80/tcp)
+FW_PORTS=("$PORT/tcp"); { [ "$CERT_MODE" = certbot ] || [ "$CERT_MODE" = builtin ]; } && FW_PORTS+=(80/tcp)
 if command -v ufw >/dev/null && ufw status 2>/dev/null | grep 'Status: active' >/dev/null; then
     for fw_port in "${FW_PORTS[@]}"; do ufw allow "$fw_port" >/dev/null; done
     info "ufw: opened ${FW_PORTS[*]}"
@@ -411,7 +528,13 @@ for _ in $(seq 1 30); do [ -n "$(port_owner "$PORT")" ] && break; sleep 1; done
 sleep 2
 # Connect to this machine for the proxy hostname; credentials go via stdin, not argv.
 check() { curl -s -o /dev/null --max-time 20 --resolve "$DOMAIN:$PORT:127.0.0.1" --proxy "https://$DOMAIN:$PORT" "$@" 2>/dev/null || true; }
-ok=$(printf 'proxy-user = "%s:%s"\n' "$P_USER" "$P_PASS" | check -K - -w '%{http_code}' "$HEALTH_URL")
+tunnel() { printf 'proxy-user = "%s:%s"\n' "$P_USER" "$P_PASS" | check -K - -w '%{http_code}' "$HEALTH_URL"; }
+TRIES=1; [ "$CERT_MODE" = builtin ] && TRIES=36
+[ "$TRIES" = 1 ] || info "waiting for the built-in ACME client to obtain the certificate (up to 3 minutes)"
+for i in $(seq 1 "$TRIES"); do
+    ok=$(tunnel); [ "$ok" = 200 ] && break
+    [ "$i" = "$TRIES" ] || sleep 5
+done
 if [ "$ok" = 200 ]; then info "health check: authenticated tunnel works (HTTP 200 via proxy)"
 else warn "health check through the proxy returned '$ok' (journalctl -u $SERVICE). Certificate or outbound network problem?"; fi
 deny=$(check -w '%{http_connect}' "$HEALTH_URL")
@@ -421,6 +544,6 @@ else warn "unauthenticated request returned '$deny', expected $expected"; fi
 
 echo
 info "deployed $REF@$COMMIT on $DOMAIN:$PORT (logs: journalctl -u $SERVICE -f)"
-echo "Also allow inbound TCP $PORT$([ "$CERT_MODE" = certbot ] && echo ' and 80') in your cloud provider's security group if it has one."
+echo "Also allow inbound TCP $PORT$([ "$CERT_MODE" != existing ] && echo ' and 80') in your cloud provider's security group if it has one."
 echo
 show_links

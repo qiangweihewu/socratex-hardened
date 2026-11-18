@@ -211,3 +211,24 @@
   - 两个部署脚本的 `--show` 都改成输出这两种格式。在 macOS bash 3.2 和服务器 bash 5.2 上生成的结果，都和 Shadowrocket 自己导出的链接逐字节一致。
   - HTTP2 开关和「填充」开关对应链接里的哪个参数还不知道：naive（Caddy）节点导入后，需要手动打开这两个开关。
 - **踩坑**：bash 3.2 有个 bug，`"$(f "{…,…}")"` 这种写法里的花括号会被展开，导致生成的 JSON 被拆成几段。改成先把 JSON 赋值给变量，再传进去。
+
+### 证书来源可选（2026-11-18，已实施）
+- **起因**：Zach 要求两个部署脚本都能选择证书来源，三个选项：
+  - 已有证书，默认路径 `/etc/letsencrypt/live/<域名>/fullchain.pem`；
+  - 重新申请；
+  - 内置证书功能。
+- **「内置证书」的解释**：理解为程序自带的 ACME 自动申请，不是 utilitas 打包的那张证书。原因是：
+  - utilitas 的 `keys/` 目录里打包了一张签给 `127.0.0.1` 的自签证书，私钥随 npm 包一起公开，绝不能用于公网部署。
+  - 实际采用的三个实现：
+    - socratex 用 utilitas 的 ACME（`ssl.mjs:82-125`），HTTP-01 验证，主进程常驻占用 80 端口，每周检查一次，到期前 30 天续期，联系邮箱固定写成 `i@域名`；
+    - naive 用 Caddy 的自动 HTTPS；
+    - anytls 用 sing-box 1.14 的 `certificate_provider: acme`。官方发布包带了 `with_acme` 构建标签（`release/DEFAULT_BUILD_TAGS`）；旧写法 `tls.acme` 已废弃，1.16 移除。
+  - sing-box 的 `data_directory` 指向 Caddy 的 certmagic 存储目录，两个程序共用一张证书和一套锁文件，避免重复申请和争抢 80 端口（这是推断，还没有用真实签发验证过）。
+- **实现**：`--cert existing|certbot|builtin`。
+  - 首次安装时，如果在终端里运行，会弹出菜单；不在终端里时，有 Let's Encrypt 证书就用 existing，否则用 certbot。
+  - 选择会保存下来，重跑时沿用；旧安装里的 `certbot`/`custom` 会自动迁移。
+  - 证书和私钥必须匹配（比对公钥），并且证书要覆盖这个域名。校验通过后才写设置文件，失败的运行不会留下错误的配置。
+  - 续期处理：`/etc/letsencrypt/live/*` 下的证书用 certbot deploy hook；其他路径的证书用 systemd path 单元。两者都调用同一个同步脚本，同步脚本会再校验一次证书和私钥是否匹配。
+- **实测**（104 服务器）：
+  - 已通过：旧模式迁移（凭据不变）、existing 默认路径、existing 自定义路径（文件变化后自动同步并重启服务；私钥不匹配时拒绝更新、不重启服务）、交互菜单、80 被 nginx 占用时 builtin 拒绝执行（状态不变）、builtin 和 existing 两种模式生成的配置都通过了 `sing-box check` 和 `caddy validate`。
+  - **未测试**：certbot 和 builtin 的真实签发。104 的 80/443 端口属于 nginx，需要一台这两个端口空闲的服务器。

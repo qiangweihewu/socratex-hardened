@@ -43,12 +43,19 @@ Usage: sudo bash deploy-protocols.sh --domain DOMAIN [options]
 Install / update (settings are kept between runs):
   --protocols LIST       Comma-separated: anytls,shadowtls,naive (default: all three)
   --domain DOMAIN        Hostname pointing at this server; needed for anytls and naive
-                         (they use its Let's Encrypt certificate)
+                         (they need a certificate for it)
   --address HOST         Address clients connect to for shadowtls when no --domain is given
                          (default: this machine's outbound IPv4 address)
-  --email EMAIL          Let's Encrypt account e-mail
-  --cert-file PATH       Use an existing certificate chain instead of certbot (you renew it)
-  --key-file PATH        Private key for --cert-file
+  --cert MODE            Certificate for anytls/naive (asked interactively on first install):
+                           existing  use certificate files already on this server
+                                     (default /etc/letsencrypt/live/DOMAIN/fullchain.pem)
+                           certbot   request a new Let's Encrypt certificate with certbot
+                                     (needs port 80 free during issuance)
+                           builtin   let Caddy / sing-box obtain and renew it themselves
+                                     (needs port 80 free, or a protocol on port 443)
+  --cert-file PATH       Certificate chain for --cert existing (implies it)
+  --key-file PATH        Private key for --cert existing (default: privkey.pem next to the chain)
+  --email EMAIL          ACME account e-mail (certbot / builtin)
   --naive-port PORT      NaïveProxy port (default 443)
   --anytls-port PORT     AnyTLS port (default 8443)
   --shadowtls-port PORT  ShadowTLS port (default 9443)
@@ -65,7 +72,7 @@ EOF
 }
 
 # ---------- arguments ----------
-ACTION=install PROTOCOLS="" DOMAIN="" ADDRESS="" EMAIL="" CERT_FILE="" KEY_FILE=""
+ACTION=install PROTOCOLS="" DOMAIN="" ADDRESS="" EMAIL="" CERT_ARG="" CERT_FILE="" KEY_FILE=""
 NAIVE_PORT="" ANYTLS_PORT="" SHADOWTLS_PORT="" SHADOWTLS_SNI="" NAME="" REGEN=0 PURGE=0
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -73,6 +80,7 @@ while [ $# -gt 0 ]; do
         --domain) DOMAIN="${2:-}"; shift ;;
         --address) ADDRESS="${2:-}"; shift ;;
         --email) EMAIL="${2:-}"; shift ;;
+        --cert) CERT_ARG="${2:-}"; shift ;;
         --cert-file) CERT_FILE="${2:-}"; shift ;;
         --key-file) KEY_FILE="${2:-}"; shift ;;
         --naive-port) NAIVE_PORT="${2:-}"; shift ;;
@@ -236,7 +244,8 @@ uninstall() {
         systemctl disable --now "$svc" 2>/dev/null || true
         rm -f "/etc/systemd/system/$svc.service"
     done
-    rm -f "$HOOK"
+    systemctl disable --now sx-proto-cert.path >/dev/null 2>&1 || true
+    rm -f "$HOOK" "$ETC/cert-sync.sh" /etc/systemd/system/sx-proto-cert.path /etc/systemd/system/sx-proto-cert.service
     systemctl daemon-reload
     rm -rf "$BASE"
     if [ "$PURGE" -eq 1 ]; then
@@ -305,13 +314,56 @@ SHADOWTLS_PASSWORD="$(keep SHADOWTLS_PASSWORD)"; SHADOWTLS_PASSWORD="${SHADOWTLS
 # Shadowsocks 2022 (aes-128) keys are 16 random bytes in base64.
 SS_PASSWORD="$(keep SS_PASSWORD)"; SS_PASSWORD="${SS_PASSWORD:-$(head -c 16 /dev/urandom | base64)}"
 
-if [ -n "$CERT_FILE$KEY_FILE" ]; then
-    [ -r "$CERT_FILE" ] && [ -r "$KEY_FILE" ] || die "--cert-file and --key-file must both be readable files"
-    CERT_MODE=custom
-else
-    CERT_MODE="$(old CERT_MODE)"; CERT_MODE="${CERT_MODE:-certbot}"
-    [ "$NEED_CERT" = 0 ] || [ "$CERT_MODE" != custom ] || [ -s "$TLS_DIR/fullchain.pem" ] \
-        || die "previous install used custom certificates; pass --cert-file/--key-file again"
+# ---------- certificate mode ----------
+# existing: copy chain/key from files already on the server (renewals are picked up by a
+#           certbot deploy hook for /etc/letsencrypt/live/*, otherwise by a systemd path unit)
+# certbot:  issue a Let's Encrypt certificate with certbot standalone if none exists, then as existing
+# builtin:  Caddy (naive) and sing-box (anytls) run ACME themselves, sharing one certificate store
+LE_LIVE=/etc/letsencrypt/live
+CERT_MODE="" CERT_SRC="" KEY_SRC=""
+if [ "$NEED_CERT" = 1 ]; then
+    prev_mode="$(old CERT_MODE)"; [ "$prev_mode" = custom ] && prev_mode=existing # pre-2026-11-18 name
+    if [ -n "$CERT_ARG" ]; then CERT_MODE="$CERT_ARG"
+    elif [ -n "$CERT_FILE$KEY_FILE" ]; then CERT_MODE=existing
+    elif [ -n "$prev_mode" ]; then CERT_MODE="$prev_mode"
+    elif [ -t 0 ] && [ -t 1 ]; then
+        default_choice=2; [ -r "$LE_LIVE/$DOMAIN/fullchain.pem" ] && default_choice=1
+        echo
+        echo "Certificate for $DOMAIN (used by anytls and naive):"
+        echo "  1) Use an existing certificate on this server (default $LE_LIVE/$DOMAIN/fullchain.pem)"
+        echo "  2) Request a new Let's Encrypt certificate with certbot (needs port 80 free)"
+        echo "  3) Built-in: Caddy / sing-box obtain and renew it automatically (needs port 80 free)"
+        read -r -p "Choose [1-3] (default $default_choice): " choice
+        case "${choice:-$default_choice}" in
+            1) CERT_MODE=existing ;; 2) CERT_MODE=certbot ;; 3) CERT_MODE=builtin ;;
+            *) die "invalid choice: $choice" ;;
+        esac
+    elif [ -r "$LE_LIVE/$DOMAIN/fullchain.pem" ]; then CERT_MODE=existing
+    else CERT_MODE=certbot
+    fi
+    case "$CERT_MODE" in existing|certbot|builtin) ;; *) die "--cert must be existing, certbot or builtin (got '$CERT_MODE')" ;; esac
+    [ "$CERT_MODE" = existing ] || [ -z "$CERT_FILE$KEY_FILE" ] || die "--cert-file/--key-file only apply to --cert existing"
+
+    if [ "$CERT_MODE" = existing ]; then
+        if [ -z "$CERT_FILE" ] && [ -z "$KEY_FILE" ] && [ -n "$(old CERT_FILE)" ]; then
+            CERT_FILE="$(old CERT_FILE)"; KEY_FILE="$(old KEY_FILE)"
+        fi
+        if [ -z "$CERT_FILE" ] && [ "$(old CERT_MODE)" = custom ]; then
+            CERT_FILE="$TLS_DIR/fullchain.pem"; KEY_FILE="$TLS_DIR/privkey.pem" # old installs kept no source path
+        fi
+        if [ -z "$CERT_FILE" ] && [ -t 0 ] && [ -t 1 ]; then
+            read -r -p "Certificate chain [$LE_LIVE/$DOMAIN/fullchain.pem]: " CERT_FILE
+            CERT_FILE="${CERT_FILE:-$LE_LIVE/$DOMAIN/fullchain.pem}"
+            read -r -p "Private key [$(dirname "$CERT_FILE")/privkey.pem]: " KEY_FILE
+        fi
+        CERT_SRC="${CERT_FILE:-$LE_LIVE/$DOMAIN/fullchain.pem}"
+        KEY_SRC="${KEY_FILE:-$(dirname "$CERT_SRC")/privkey.pem}"
+        [[ "$CERT_SRC" == /* && "$KEY_SRC" == /* ]] || die "certificate paths must be absolute"
+        [ -r "$CERT_SRC" ] || die "certificate not found: $CERT_SRC (use --cert certbot or --cert builtin to get one)"
+        [ -r "$KEY_SRC" ] || die "private key not found: $KEY_SRC (pass --key-file)"
+    elif [ "$CERT_MODE" = certbot ]; then
+        CERT_SRC="$LE_LIVE/$DOMAIN/fullchain.pem"; KEY_SRC="$LE_LIVE/$DOMAIN/privkey.pem"
+    fi
 fi
 
 case "$(uname -m)" in
@@ -342,8 +394,17 @@ apt-get install -y -qq --no-install-recommends "${PKGS[@]}" >/dev/null
 has naive && check_port_free "$NAIVE_PORT" caddy
 has anytls && check_port_free "$ANYTLS_PORT" sing-box
 has shadowtls && check_port_free "$SHADOWTLS_PORT" sing-box
-if [ "$NEED_CERT" = 1 ] && [ "$CERT_MODE" = certbot ] && [ ! -d "/etc/letsencrypt/live/$DOMAIN" ]; then
-    owner="$(port_owner 80)"; [ -z "$owner" ] || die "certbot needs port 80 free for the HTTP-01 challenge, but it is used by: $owner (free it, or use --cert-file/--key-file)"
+if [ "$CERT_MODE" = certbot ] && [ ! -r "$CERT_SRC" ]; then
+    owner="$(port_owner 80)"; [ -z "$owner" ] || die "certbot needs port 80 free for the HTTP-01 challenge, but it is used by: $owner (free it, or use --cert existing / --cert builtin)"
+fi
+if [ "$CERT_MODE" = builtin ]; then
+    # ACME needs HTTP-01 on port 80, or TLS-ALPN-01 on a protocol listening on 443.
+    owner="$(port_owner 80)"
+    on443=0; { { has naive && [ "$NAIVE_PORT" = 443 ]; } || { has anytls && [ "$ANYTLS_PORT" = 443 ]; }; } && on443=1
+    if [ -n "$owner" ] && [[ "$owner" != *'"caddy"'* && "$owner" != *'"sing-box"'* ]]; then
+        [ "$on443" = 1 ] || die "--cert builtin needs port 80 free for ACME (used by: $owner), or naive/anytls on port 443"
+        warn "port 80 is busy ($owner); ACME will rely on the TLS-ALPN challenge on port 443"
+    fi
 fi
 if [ -n "$DOMAIN" ]; then
     resolved="$(getent ahosts "$DOMAIN" | awk '{print $1}' | sort -u | tr '\n' ' ' || true)"
@@ -404,6 +465,100 @@ id "$SVC_USER" >/dev/null 2>&1 || useradd --system --home-dir "$STATE" --shell /
 install -d -m 750 -o "$SVC_USER" -g "$SVC_USER" "$STATE"
 install -d -m 755 "$ETC"
 install -d -m 750 -o root -g "$SVC_USER" "$TLS_DIR"
+# ---------- certificate ----------
+RESTART_LIST="$SB_SERVICE $NAIVE_SERVICE"
+SYNC="$ETC/cert-sync.sh"
+CERT_UNIT=sx-proto-cert
+key_fingerprint() { openssl pkey -in "$1" -pubout -outform DER 2>/dev/null | sha256sum; }
+cert_fingerprint() { openssl x509 -noout -pubkey -in "$1" 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum; }
+check_cert() { # $1 chain, $2 key
+    openssl x509 -noout -checkhost "$DOMAIN" -in "$1" 2>/dev/null | grep 'does match' >/dev/null \
+        || die "$1 is not a certificate for $DOMAIN"
+    [ "$(cert_fingerprint "$1")" = "$(key_fingerprint "$2")" ] || die "$2 is not the private key of $1"
+    openssl x509 -noout -checkend 604800 -in "$1" >/dev/null || warn "the certificate expires within 7 days"
+}
+remove_cert_sync() {
+    rm -f "$HOOK" "$SYNC"
+    systemctl disable --now "$CERT_UNIT.path" >/dev/null 2>&1 || true
+    rm -f "/etc/systemd/system/$CERT_UNIT.path" "/etc/systemd/system/$CERT_UNIT.service"
+}
+CERT_RENEWAL=""
+remove_cert_sync
+if [ "$NEED_CERT" = 1 ] && [ "$CERT_MODE" != builtin ]; then
+    if [ "$CERT_MODE" = certbot ] && [ ! -r "$CERT_SRC" ]; then
+        info "requesting a Let's Encrypt certificate for $DOMAIN"
+        args=(certonly --standalone --preferred-challenges http --non-interactive --agree-tos -d "$DOMAIN")
+        if [ -n "$EMAIL" ]; then args+=(-m "$EMAIL"); else args+=(--register-unsafely-without-email); fi
+        if certbot --help all 2>/dev/null | grep -- '--key-type' >/dev/null; then args+=(--key-type ecdsa); fi
+        certbot "${args[@]}" || die "certbot failed: check that $DOMAIN points here and inbound TCP 80 is open"
+    fi
+    [[ "$CERT_SRC" =~ ^/[A-Za-z0-9._/@+-]+$ && "$KEY_SRC" =~ ^/[A-Za-z0-9._/@+-]+$ ]] \
+        || die "certificate paths may only contain letters, digits and . _ / @ + -"
+    check_cert "$CERT_SRC" "$KEY_SRC"
+    if [ "$CERT_SRC" != "$TLS_DIR/fullchain.pem" ]; then
+        # One script copies the pair into place and restarts the services. It runs now,
+        # from certbot after renewals of a /etc/letsencrypt/live lineage, or from a path unit.
+        cat > "$SYNC" <<EOF
+#!/bin/sh
+# Installed by socratex scripts/deploy-protocols.sh: copy the certificate into place and restart.
+set -e
+[ "\${1:-}" = --delay ] && sleep 5  # path unit: let the writer finish both files
+cert=$CERT_SRC key=$KEY_SRC
+a=\$(openssl x509 -noout -pubkey -in "\$cert" | openssl pkey -pubin -outform DER | sha256sum)
+b=\$(openssl pkey -in "\$key" -pubout -outform DER | sha256sum)
+[ "\$a" = "\$b" ] || { echo "\$cert and \$key do not match; not updating" >&2; exit 1; }
+install -m 640 -o root -g $SVC_USER "\$cert" $TLS_DIR/fullchain.pem
+install -m 640 -o root -g $SVC_USER "\$key" $TLS_DIR/privkey.pem
+[ "\${1:-}" = --no-restart ] && exit 0
+for svc in $RESTART_LIST; do
+    if systemctl is-enabled --quiet "\$svc" 2>/dev/null; then systemctl restart "\$svc"; fi
+done
+EOF
+        chmod 700 "$SYNC"
+        "$SYNC" --no-restart
+        if [[ "$CERT_SRC" =~ ^/etc/letsencrypt/live/([^/]+)/ ]]; then
+            lineage="/etc/letsencrypt/live/${BASH_REMATCH[1]}"
+            mkdir -p "$(dirname "$HOOK")"
+            cat > "$HOOK" <<EOF
+#!/bin/sh
+# Installed by socratex scripts/deploy-protocols.sh: pick up renewals of $lineage.
+[ "\$RENEWED_LINEAGE" = "$lineage" ] || exit 0
+exec $SYNC
+EOF
+            chmod 755 "$HOOK"
+            CERT_RENEWAL="certbot deploy hook for $lineage"
+        else
+            cat > "/etc/systemd/system/$CERT_UNIT.service" <<EOF
+[Unit]
+Description=sx-proto: install the renewed certificate
+
+[Service]
+Type=oneshot
+ExecStart=$SYNC --delay
+EOF
+            cat > "/etc/systemd/system/$CERT_UNIT.path" <<EOF
+[Unit]
+Description=sx-proto: watch $CERT_SRC for renewals
+
+[Path]
+PathChanged=$CERT_SRC
+PathChanged=$KEY_SRC
+
+[Install]
+WantedBy=multi-user.target
+EOF
+            systemctl daemon-reload
+            systemctl enable -q --now "$CERT_UNIT.path"
+            CERT_RENEWAL="systemd path unit $CERT_UNIT.path copies the files again when they change"
+        fi
+    else
+        CERT_RENEWAL="none: replace $TLS_DIR/*.pem yourself and restart the services"
+    fi
+    info "certificate: $CERT_SRC ($CERT_MODE); renewals: $CERT_RENEWAL"
+elif [ "$CERT_MODE" = builtin ]; then
+    info "certificate: obtained and renewed by Caddy / sing-box via ACME (store: $STATE/caddy)"
+fi
+
 tmp_set="$(mktemp)"
 cat > "$tmp_set" <<EOF
 PROTOCOLS=$PROTOCOLS
@@ -411,6 +566,8 @@ DOMAIN=$DOMAIN
 ADDRESS=$ADDRESS
 NAME=$NAME
 CERT_MODE=$CERT_MODE
+CERT_FILE=$([ "$CERT_MODE" = existing ] && echo "$CERT_SRC" || true)
+KEY_FILE=$([ "$CERT_MODE" = existing ] && echo "$KEY_SRC" || true)
 NAIVE_PORT=$NAIVE_PORT
 NAIVE_USER=$NAIVE_USER
 NAIVE_PASSWORD=$NAIVE_PASSWORD
@@ -423,44 +580,6 @@ SS_PASSWORD=$SS_PASSWORD
 EOF
 install -m 600 -o root -g root "$tmp_set" "$SETTINGS"; rm -f "$tmp_set"
 
-# ---------- certificate ----------
-RESTART_LIST="$SB_SERVICE $NAIVE_SERVICE"
-install_cert() { # $1 chain, $2 key
-    install -m 640 -o root -g "$SVC_USER" "$1" "$TLS_DIR/fullchain.pem"
-    install -m 640 -o root -g "$SVC_USER" "$2" "$TLS_DIR/privkey.pem"
-}
-if [ "$NEED_CERT" = 1 ]; then
-    if [ "$CERT_MODE" = custom ]; then
-        [ -z "$CERT_FILE" ] || install_cert "$CERT_FILE" "$KEY_FILE"
-        warn "custom certificate: renew it yourself and re-run with --cert-file/--key-file"
-    else
-        if [ ! -d "/etc/letsencrypt/live/$DOMAIN" ]; then
-            info "requesting a Let's Encrypt certificate for $DOMAIN"
-            args=(certonly --standalone --preferred-challenges http --non-interactive --agree-tos -d "$DOMAIN")
-            if [ -n "$EMAIL" ]; then args+=(-m "$EMAIL"); else args+=(--register-unsafely-without-email); fi
-            if certbot --help all 2>/dev/null | grep -- '--key-type' >/dev/null; then args+=(--key-type ecdsa); fi
-            certbot "${args[@]}" || die "certbot failed: check that $DOMAIN points here and inbound TCP 80 is open"
-        fi
-        mkdir -p "$(dirname "$HOOK")"
-        cat > "$HOOK" <<EOF
-#!/bin/sh
-# Installed by socratex scripts/deploy-protocols.sh: copy renewed certificates and restart.
-set -e
-[ "\$RENEWED_LINEAGE" = "/etc/letsencrypt/live/$DOMAIN" ] || exit 0
-install -m 640 -o root -g $SVC_USER "\$RENEWED_LINEAGE/fullchain.pem" $TLS_DIR/fullchain.pem
-install -m 640 -o root -g $SVC_USER "\$RENEWED_LINEAGE/privkey.pem" $TLS_DIR/privkey.pem
-for svc in $RESTART_LIST; do
-    if systemctl is-enabled --quiet "\$svc" 2>/dev/null; then systemctl restart "\$svc"; fi
-done
-EOF
-        chmod 755 "$HOOK"
-        install_cert "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" "/etc/letsencrypt/live/$DOMAIN/privkey.pem"
-    fi
-    openssl x509 -noout -checkhost "$DOMAIN" -in "$TLS_DIR/fullchain.pem" 2>/dev/null | grep 'does match' >/dev/null \
-        || die "the certificate in $TLS_DIR does not cover $DOMAIN"
-    openssl x509 -noout -checkend 604800 -in "$TLS_DIR/fullchain.pem" >/dev/null \
-        || warn "the certificate expires within 7 days"
-fi
 
 # ---------- systemd unit ----------
 write_unit() { # $1 service, $2 description, $3 ExecStart
@@ -511,12 +630,20 @@ if [ "$NEED_SB" = 1 ]; then
     info "writing sing-box configuration"
     inbounds="[]"
     if has anytls; then
+        # builtin: sing-box's ACME provider stores into Caddy's certmagic directory, so
+        # naive and anytls share one certificate and coordinate through its lock files.
         inbounds="$(jq -c --arg port "$ANYTLS_PORT" --arg name "$NAME" --arg pw "$ANYTLS_PASSWORD" \
-            --arg domain "$DOMAIN" --arg tls "$TLS_DIR" '. + [{
+            --arg domain "$DOMAIN" --arg tls "$TLS_DIR" --arg mode "$CERT_MODE" --arg store "$STATE/caddy" \
+            --arg email "$EMAIL" '. + [{
                 type: "anytls", tag: "anytls-in", listen: "::", listen_port: ($port | tonumber),
                 users: [{name: $name, password: $pw}],
-                tls: {enabled: true, server_name: $domain,
-                      certificate_path: ($tls + "/fullchain.pem"), key_path: ($tls + "/privkey.pem")}
+                tls: ({enabled: true, server_name: $domain} + (if $mode == "builtin" then {
+                        certificate_provider: ({type: "acme", domain: [$domain], data_directory: $store,
+                            default_server_name: $domain, key_type: "p256"}
+                            + (if $email != "" then {email: $email} else {} end))
+                      } else {
+                        certificate_path: ($tls + "/fullchain.pem"), key_path: ($tls + "/privkey.pem")
+                      } end))
             }]' <<< "$inbounds")"
     fi
     if has shadowtls; then
@@ -561,10 +688,19 @@ if has naive; then
 <body><h1>Welcome</h1><p>This site is under construction.</p></body></html>
 EOF
     fi
+    if [ "$CERT_MODE" = builtin ]; then
+        # ":PORT" must come first so CONNECT requests for any host reach forward_proxy;
+        # "DOMAIN:PORT" makes Caddy obtain and renew the certificate itself.
+        site=":$NAIVE_PORT, $DOMAIN:$NAIVE_PORT"; tls_line=""
+        email_line=""; [ -z "$EMAIL" ] || email_line="	email $EMAIL"
+    else
+        site=":$NAIVE_PORT"; tls_line="	tls $TLS_DIR/fullchain.pem $TLS_DIR/privkey.pem"; email_line=""
+    fi
     cat > "$TMP/Caddyfile" <<EOF
 {
 	admin off
 	auto_https disable_redirects
+$email_line
 	order forward_proxy before file_server
 	servers {
 		protocols h1 h2
@@ -574,8 +710,8 @@ EOF
 	}
 }
 
-:$NAIVE_PORT {
-	tls $TLS_DIR/fullchain.pem $TLS_DIR/privkey.pem
+$site {
+$tls_line
 	forward_proxy {
 		basic_auth $NAIVE_USER $NAIVE_PASSWORD
 		hide_ip
@@ -603,13 +739,13 @@ fi
 
 systemctl daemon-reload
 STARTED=()
-[ "$NEED_SB" = 1 ] && STARTED+=("$SB_SERVICE")
 has naive && STARTED+=("$NAIVE_SERVICE")
+[ "$NEED_SB" = 1 ] && STARTED+=("$SB_SERVICE")
 for svc in "${STARTED[@]}"; do systemctl enable -q "$svc"; systemctl restart "$svc"; done
 
 # ---------- firewall ----------
 FW_PORTS=(); for port in "${USED_PORTS[@]}"; do FW_PORTS+=("$port/tcp"); done
-[ "$NEED_CERT" = 1 ] && [ "$CERT_MODE" = certbot ] && FW_PORTS+=(80/tcp)
+{ [ "$CERT_MODE" = certbot ] || [ "$CERT_MODE" = builtin ]; } && FW_PORTS+=(80/tcp)
 if command -v ufw >/dev/null && ufw status 2>/dev/null | grep 'Status: active' >/dev/null; then
     for fw_port in "${FW_PORTS[@]}"; do ufw allow "$fw_port" >/dev/null; done
     info "ufw: opened ${FW_PORTS[*]}"
@@ -629,10 +765,21 @@ for port in "${USED_PORTS[@]}"; do
 done
 sleep 1
 FAILED=0
+TRIES=1; [ "$CERT_MODE" = builtin ] && TRIES=36  # ACME issuance: up to 3 minutes
+[ "$TRIES" = 1 ] || info "waiting for the built-in ACME clients to obtain the certificate (up to 3 minutes)"
+retry() { # $1 expected output, rest: command; prints the last output
+    local i out=""
+    for i in $(seq 1 "$TRIES"); do
+        out="$("${@:2}" 2>/dev/null || true)"; [ "$out" = "$1" ] && break
+        [ "$i" = "$TRIES" ] || sleep 5
+    done
+    printf '%s' "$out"
+}
 if has naive; then
     naive_check() { curl -s -o /dev/null --max-time 20 --resolve "$DOMAIN:$NAIVE_PORT:127.0.0.1" "$@" 2>/dev/null || true; }
-    code=$(printf 'proxy-user = "%s:%s"\n' "$NAIVE_USER" "$NAIVE_PASSWORD" \
-        | naive_check -K - --proxy "https://$DOMAIN:$NAIVE_PORT" -w '%{http_code}' "$HEALTH_URL")
+    naive_tunnel() { printf 'proxy-user = "%s:%s"\n' "$NAIVE_USER" "$NAIVE_PASSWORD" \
+        | naive_check -K - --proxy "https://$DOMAIN:$NAIVE_PORT" -w '%{http_code}' "$HEALTH_URL"; }
+    code=$(retry 204 naive_tunnel)
     if [ "$code" = 204 ]; then info "naive: authenticated tunnel works"; else warn "naive: tunnel check returned '$code'"; FAILED=1; fi
     code=$(naive_check -w '%{http_code}' "https://$DOMAIN:$NAIVE_PORT/")
     if [ "$code" = 200 ]; then info "naive: unauthenticated visitors see the decoy website"; else warn "naive: decoy site returned '$code'"; FAILED=1; fi
@@ -672,7 +819,7 @@ if [ "$NEED_SB" = 1 ]; then
     sleep 2
     i=0
     for tag in "${probe_tags[@]}"; do
-        code=$(curl -s -o /dev/null --max-time 20 -w '%{http_code}' --socks5-hostname "127.0.0.1:$((probe_port + i))" "$HEALTH_URL" 2>/dev/null || true)
+        code=$(retry 204 curl -s -o /dev/null --max-time 20 -w '%{http_code}' --socks5-hostname "127.0.0.1:$((probe_port + i))" "$HEALTH_URL")
         if [ "$code" = 204 ]; then info "$tag: end-to-end check through the protocol works"
         else warn "$tag: end-to-end check returned '$code' (journalctl -u $SB_SERVICE)"; FAILED=1; fi
         i=$((i + 1))
