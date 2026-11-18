@@ -185,3 +185,29 @@
 - **预注册判据**：
   - 实际使用中明显感到“打开新网站慢”，而且从客户端侧测得到 socratex 的 TLS 握手中位数 ≥300ms，才立项。
   - 立项后，在同一台服务器上用 Caddy forwardproxy（h2）和 socratex（h1）做 A/B：分别对 20 个新域名测首字节时间，并测 1 个大文件的吞吐。h2 首字节时间中位数改善 ≥30%，并且吞吐下降不超过 10%，才合并。
+
+### 一键部署 anytls / shadow-tls / naiveproxy（2026-11-17，已实施）
+- **起因**：Zach 要求在本仓库增加这三个协议的一键部署脚本，参考 s-ui 的安装脚本。s-ui 是 GPL-3.0，只参考了它的流程（选架构、校验下载、首次安装生成随机凭据），没有复制代码。
+- **选型（已拍板，Zach 选定）**：
+  - anytls 和 shadow-tls 用 sing-box v1.14.4，一个服务里跑两个入站。
+  - naive 用官方的 Caddy + klzgrad/forwardproxy v2.11.7-naive2。
+  - 没选 sing-box 的 naive 入站，是因为它不防主动探测：非 CONNECT 请求和不带 `Padding` 头的请求一律返回 400 并重置连接（`protocol/naive/inbound.go:148-156`）。Caddy 版有 `probe_resistance`，对外是一个普通网站。
+- **代价**：forwardproxy 只发布了 x86-64 版本，arm64 上只能部署 anytls 和 shadowtls，naive 改用 socratex。
+- **实现**：`scripts/deploy-protocols.sh`。
+  - 二进制从 GitHub Release 下载，并按 API 返回的 `digest`（sha256）校验。
+  - 生成的配置先用 `sing-box check` 和 `caddy validate` 校验，通过后才替换旧配置。
+  - 两个服务都禁止连到私有地址、CGNAT 地址和 169.254/16。forwardproxy 默认只拦 RFC 1918 和回环地址（`forwardproxy.go:156-169`），云元数据地址 169.254.169.254 是我们补上的。
+  - shadow-tls 后端是 Shadowsocks 2022，只支持 TCP，开了 strict_mode。
+- **实测**（104 服务器，端口 8444/8445/8446）：
+  - 从公网访问，三条链路的 `generate_204` 都是 20/20 成功；31.7MB 文件下载 3 次，sha256 全部一致。
+  - 探测结果：naive 看到的是 Caddy 网站，未授权的 CONNECT 返回 308；shadowtls 不管带什么 SNI，看到的都是微软的真实证书和网站；anytls 握手后直接断开。
+  - 升级（重复运行）、增减协议、续期 hook、卸载后重装都验证过。
+- **已知弱点**：anytls 认证失败时没有 fallback（anytls FAQ 自己承认这一点）。
+- **未测试**：certbot 新签证书、arm64、不提供域名只用 `--address` 的情况、各客户端导入 `anytls://` 链接、Shadowrocket 的 ShadowTLS 配置。
+- **Shadowrocket 导入链接**（2026-11-17，由 Zach 在 macOS 版 Shadowrocket 上导出确认）：
+  - Shadowrocket 不认 `naive+https://`。
+  - HTTPS 节点的格式是 `https://user:pass@host:port?peer=<SNI>&method=auto&fingerprint=Safari26_3#name`。
+  - Shadowsocks + ShadowTLS 节点的格式是 `ss://` + base64url(`method:password@host:port`) + `?shadow-tls=` + base64url(`{"version":"3","host":…,"password":…}`)，不带 padding。
+  - 两个部署脚本的 `--show` 都改成输出这两种格式。在 macOS bash 3.2 和服务器 bash 5.2 上生成的结果，都和 Shadowrocket 自己导出的链接逐字节一致。
+  - HTTP2 开关和「填充」开关对应链接里的哪个参数还不知道：naive（Caddy）节点导入后，需要手动打开这两个开关。
+- **踩坑**：bash 3.2 有个 bug，`"$(f "{…,…}")"` 这种写法里的花括号会被展开，导致生成的 JSON 被拆成几段。改成先把 JSON 赋值给变量，再传进去。

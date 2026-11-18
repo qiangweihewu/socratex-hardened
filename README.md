@@ -41,17 +41,41 @@ sudo bash deploy.sh --domain proxy.example.com --email you@example.com
 
 What it does: installs official Node.js 22 (SHA-256 verified) unless Node 22+ is present, deploys the repository at `--ref` (default `main`) to `/opt/socratex`, obtains an ECDSA Let's Encrypt certificate with certbot (a deploy hook copies renewals and restarts the service), generates random credentials, and runs the service as the unprivileged `socratex` user with systemd sandboxing. Credentials live in `/etc/socratex/socratex.env` (root-only) and reach the process through the environment, so they never appear in the process list. A health check then confirms an authenticated tunnel works and an unauthenticated one is rejected.
 
-It finally prints a NaïveProxy share link (`naive+https://…`, also as a QR code) for NekoBox/husi/Exclave/v2rayN, a standard `https://user:pass@host:port` proxy URL, a Clash Meta/mihomo `proxies` entry, and the fields to enter in Shadowrocket by hand. The naive link format follows the NekoBox and v2rayN parsers; Shadowrocket has no verified import-link format, so it gets plain fields.
+It finally prints a NaïveProxy share link (`naive+https://…`, also as a QR code) for NekoBox/husi/Exclave/v2rayN, a standard `https://user:pass@host:port` proxy URL, a Clash Meta/mihomo `proxies` entry, and a Shadowrocket import link (`https://user:pass@host:port?peer=host&method=auto&fingerprint=Safari26_3#name`). The naive link format follows the NekoBox and v2rayN parsers. Shadowrocket rejects `naive+https://`; its link format was taken from a node Shadowrocket (macOS) itself exported, and the script's output is byte-identical to that export.
 
 Useful options: `--stealth` (probe resistance; also prints the browser secret link), `--port`, `--user`/`--password`, `--cert-file`/`--key-file` (bring your own certificate instead of certbot), `--tune-network` (BBR and TCP buffers), `--ref`, `--name`. Re-running updates the code and keeps credentials; `sudo bash deploy.sh --show` prints the links again; `--uninstall [--purge]` removes it. Tested on Ubuntu 24.04 (arm64, systemd container) with a custom certificate (install, re-run with `--stealth`, `--show`, `--uninstall --purge`), and on a live Debian 12 x64 server that already ran nginx on 80/443: deployed on port 8443 reusing the host's existing Let's Encrypt certificate, upgraded by re-running with no arguments (settings kept), and verified from the public internet with curl and the official naive client over HTTPS (140 downloads; one transient TLS error at the destination). Fresh certificate issuance via certbot standalone has not been exercised yet.
 
 `main.mjs` also reads `SOCRATEX_USER`, `SOCRATEX_PASSWORD` and `SOCRATEX_SECRET_DOMAIN` from the environment when the matching options are not given.
 
+### AnyTLS, ShadowTLS and NaïveProxy servers
+
+`scripts/deploy-protocols.sh` deploys three other proxy protocols next to (or instead of) Socratex, using upstream server implementations rather than code from this repository:
+
+| Protocol | Server | Default port | Client config printed |
+|---|---|---|---|
+| NaïveProxy | Caddy with [klzgrad/forwardproxy](https://github.com/klzgrad/forwardproxy) (the official naive server: HTTP/2, `probe_resistance`, decoy static site) | 443 | `naive+https://` link and QR code, Shadowrocket `https://…?peer=` link, mihomo |
+| AnyTLS | [sing-box](https://github.com/SagerNet/sing-box) `anytls` inbound | 8443 | `anytls://` link and QR code ([URI format](https://github.com/anytls/anytls-go/blob/main/docs/uri_scheme.md)), mihomo, sing-box outbound |
+| ShadowTLS v3 | sing-box `shadowtls` inbound (strict mode) in front of Shadowsocks 2022 (`2022-blake3-aes-128-gcm`, TCP only) | 9443 | Shadowrocket `ss://…?shadow-tls=` link and QR code, mihomo (`ss` + `shadow-tls` plugin), sing-box outbounds; no cross-client standard link exists |
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/qiangweihewu/socratex-hardened/main/scripts/deploy-protocols.sh
+sudo bash deploy-protocols.sh --domain proxy.example.com --email you@example.com
+sudo bash deploy-protocols.sh --protocols anytls,shadowtls --domain proxy.example.com   # pick a subset
+```
+
+Both binaries come from the projects' latest GitHub releases and are checked against the SHA-256 digest GitHub publishes for each asset. Generated configurations are validated (`sing-box check`, `caddy validate`) before anything is replaced. AnyTLS and NaïveProxy use the domain's Let's Encrypt certificate (same certbot / reuse / `--cert-file` logic as `deploy.sh`; the deploy hook restarts both services). ShadowTLS needs no certificate: it borrows the TLS 1.3 handshake of `--shadowtls-sni` (default `www.microsoft.com`, checked for TLS 1.3 from the server), and clients must use that same SNI. Both services run as the unprivileged `sx-proto` user with the same systemd sandboxing as Socratex. Outbound connections to loopback, private, CGNAT and link-local (cloud metadata) addresses are refused. Settings and passwords live in `/etc/sx-proto/settings.env` (root-only); re-running updates both binaries and keeps them (`--regenerate` makes new passwords). `--show` prints the client configuration again and `--uninstall [--purge]` removes everything.
+
+After installing, the script drives each protocol end to end with a temporary sing-box client on loopback, fetches a page through naive, and checks what an unauthenticated visitor sees.
+
+Limits: the official Caddy build is x86-64 only, so on arm64 deploy `--protocols anytls,shadowtls` (Socratex itself also speaks the naive protocol). Caddy negotiates HTTP/2, so after importing the naive node into Shadowrocket turn its HTTP2 switch on (or set ALPN to `http/1.1`); the import link cannot carry that switch yet. Shadowrocket's ShadowTLS link is `ss://` + base64url(`method:password@host:port`) + `?shadow-tls=` + base64url(`{"version":"3","host":…,"password":…}`), reconstructed from a Shadowrocket export and matched byte for byte. AnyTLS has no fallback: an unauthenticated client completes TLS and is then disconnected, which the AnyTLS FAQ lists as a known weakness.
+
+Tested on a live Debian 12 x64 server alongside nginx and Socratex (ports 8444/8445/8446, reusing an existing certificate). From the public internet: each protocol fetched `generate_204` 20/20 times and downloaded a 31.7 MB file three times with a matching SHA-256; private and metadata addresses were refused. Probes saw a plain Caddy site (unauthenticated `CONNECT` gets 308, never 407) on naive, Microsoft's real certificate and site on ShadowTLS for any SNI, and a closed connection after TLS on AnyTLS. Re-running, dropping and re-adding a protocol, the renewal hook, and uninstall plus reinstall (credentials kept) were also exercised. Not yet tested: fresh certbot issuance, arm64, and `--address` without a domain.
+
 ## Client configuration
 
 The required protocol is **HTTPS forward proxy** (TLS to the proxy), with the proxy domain, port, Basic username and password. Preserve normal server certificate validation. No VPN, MITM certificate, or destination TLS interception is required by this server.
 
-For Shadowrocket, use those standard parameters; exact UI steps and import URLs are intentionally omitted. This revision has not been tested on a real Shadowrocket device. Desktop/mobile compatibility must be checked on the intended client before deployment.
+For Shadowrocket, `scripts/deploy.sh --show` prints an import link in the format Shadowrocket itself exports (`https://user:pass@host:port?peer=host&method=auto&fingerprint=Safari26_3#name`); keep the node's HTTP2 switch off and ALPN at its default, since this server speaks HTTP/1.1 and negotiates no ALPN. Import was confirmed in Shadowrocket on macOS; end-to-end browsing through it has not been reported yet.
 
 A protocol check with curl (use your own trusted hostname and credentials):
 

@@ -132,8 +132,9 @@ show_links() {
         echo "    tls: true"
         echo "    sni: $d"
         echo
-        echo "[Shadowrocket] add manually: Type HTTPS, Address $d, Port $port, User $u, Password $p"
-        echo "  (import-link format not verified for Shadowrocket; enter the fields by hand)"
+        echo "[Shadowrocket] import from clipboard (format Shadowrocket itself exports):"
+        echo "https://$u:$p@$d:$port?peer=$d&method=auto&fingerprint=Safari26_3#$name"
+        echo "  Keep HTTP2 off in the node's TLS settings: this server speaks HTTP/1.1."
         echo
         echo "[Test from any machine]"
         echo "curl -sS -o /dev/null -w '%{http_code}\\n' --proxy 'https://$u:$p@$d:$port' https://www.gstatic.com/generate_204"
