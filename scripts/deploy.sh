@@ -24,6 +24,7 @@ SERVICE=socratex
 UNIT="/etc/systemd/system/$SERVICE.service"
 HOOK=/etc/letsencrypt/renewal-hooks/deploy/socratex.sh
 SYSCTL_FILE=/etc/sysctl.d/90-socratex.conf
+SNI_TOOL=/usr/local/sbin/sx-nginx-sni # scripts/nginx_sni.py, kept for --uninstall
 HEALTH_URL="https://1.1.1.1/cdn-cgi/trace"
 
 info() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
@@ -40,6 +41,10 @@ Install / update:
   --domain DOMAIN       Public hostname whose DNS A/AAAA record points here (asked for if missing on first install)
   --email EMAIL         Let's Encrypt account e-mail for --cert certbot (optional; asked if missing)
   --port PORT           Proxy port (default 443)
+  --nginx-sni           The port is nginx's (its websites): share it by TLS server name. nginx forwards
+                        DOMAIN to Socratex on 127.0.0.1 and keeps serving every other name. Each nginx
+                        file that needs a change is shown as a diff and changed only with your OK, so
+                        the first run needs a terminal (offered automatically when nginx holds the port)
   --user NAME           Proxy username (default: kept, else random)
   --password PASS       Proxy password, 12-128 chars of [A-Za-z0-9._~-] (default: kept, else random)
   --stealth             Probe resistance: unauthenticated requests get 404 instead of 407
@@ -71,12 +76,13 @@ EOF
 
 # ---------- arguments ----------
 ACTION=install DOMAIN="" EMAIL="" PORT="" P_USER="" P_PASS="" STEALTH="" CERT_ARG="" CERT_FILE="" KEY_FILE="" WEBROOT="" STOP_SVC=""
-TUNE=0 REF="" REPO_URL="" NAME="" PURGE=0
+TUNE=0 REF="" REPO_URL="" NAME="" PURGE=0 NGINX_SNI=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --domain) DOMAIN="${2:-}"; shift ;;
         --email) EMAIL="${2:-}"; shift ;;
         --port) PORT="${2:-}"; shift ;;
+        --nginx-sni) NGINX_SNI=1 ;;
         --user) P_USER="${2:-}"; shift ;;
         --password) P_PASS="${2:-}"; shift ;;
         --stealth) STEALTH=1 ;;
@@ -106,6 +112,7 @@ done
 load_env() {
     [ -f "$ENV_FILE" ] || return 0
     local key value
+    OLD_PUBLIC_PORT=""
     while IFS='=' read -r key value; do
         case "$key" in
             SOCRATEX_USER) OLD_USER="$value" ;; SOCRATEX_PASSWORD) OLD_PASS="$value" ;;
@@ -114,11 +121,14 @@ load_env() {
             DEPLOY_REF) OLD_REF="$value" ;; DEPLOY_REPO) OLD_REPO="$value" ;;
             DEPLOY_NAME) OLD_NAME="$value" ;; DEPLOY_CERT) OLD_CERT="$value" ;;
             DEPLOY_CERT_FILE) OLD_CERT_FILE="$value" ;; DEPLOY_KEY_FILE) OLD_KEY_FILE="$value" ;;
+            DEPLOY_PUBLIC_PORT) OLD_PUBLIC_PORT="$value" ;; DEPLOY_NGINX_SNI) OLD_SNI="$value" ;;
         esac
     done < "$ENV_FILE"
+    # Behind nginx (--nginx-sni) Socratex listens on 127.0.0.1:SOCRATEX_PORT; clients use the public port.
+    if [ -n "$OLD_PUBLIC_PORT" ]; then OLD_LISTEN_PORT="$OLD_PORT"; OLD_PORT="$OLD_PUBLIC_PORT"; fi
 }
 OLD_USER="" OLD_PASS="" OLD_DOMAIN="" OLD_PORT="" OLD_SECRET="" OLD_STEALTH="" OLD_REF="" OLD_REPO="" OLD_NAME="" OLD_CERT=""
-OLD_CERT_FILE="" OLD_KEY_FILE=""
+OLD_CERT_FILE="" OLD_KEY_FILE="" OLD_SNI="" OLD_LISTEN_PORT="" OLD_PUBLIC_PORT=""
 load_env
 
 # ---------- client links ----------
@@ -172,6 +182,11 @@ show_links() {
 
 # ---------- uninstall ----------
 uninstall() {
+    if [ "$OLD_SNI" = 1 ] && [ -f "$SNI_TOOL" ]; then
+        info "giving port $OLD_PORT back to nginx (only the lines the deploy script changed are restored)"
+        python3 -I "$SNI_TOOL" remove --owner "$SERVICE" || warn "could not undo the nginx port sharing; see: python3 $SNI_TOOL status"
+    fi
+    [ -f /etc/sx-sni/state.json ] || rm -f "$SNI_TOOL"
     info "stopping and removing the $SERVICE service"
     systemctl disable --now "$SERVICE" 2>/dev/null || true
     systemctl disable --now "$SERVICE-cert.path" >/dev/null 2>&1 || true
@@ -208,6 +223,10 @@ fi
 DOMAIN="${DOMAIN,,}"
 PORT="${PORT:-${OLD_PORT:-443}}"
 [[ "$PORT" =~ ^[0-9]+$ ]] && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || die "invalid port: $PORT"
+if [ -z "$NGINX_SNI" ]; then # sharing the port with nginx carries over while the port stays the same
+    NGINX_SNI=0
+    if [ "$OLD_SNI" = 1 ] && [ "$PORT" = "$OLD_PORT" ]; then NGINX_SNI=1; fi
+fi
 REF="${REF:-${OLD_REF:-main}}"
 REPO_URL="${REPO_URL:-${OLD_REPO:-$REPO_URL_DEFAULT}}"
 NAME="${NAME:-${OLD_NAME:-socratex}}"
@@ -258,26 +277,26 @@ case "$CERT_MODE" in existing|certbot|builtin) ;; *) die "--cert must be existin
 # ---------- port 80 for ACME ----------
 interactive() { [ -t 0 ] && [ -t 1 ]; }
 port_owner() { ss -ltnpH "sport = :$1" 2>/dev/null | awk 'NR == 1' || true; }
-# Who listens on port 80: sets P80_OWNER (raw ss line), P80_UNIT (its systemd service, if it is
-# safe to stop), P80_DESC (readable) and P80_NOTE (why it cannot be stopped for certbot).
-describe_port80() {
+# Who listens on a port: sets PO_OWNER (raw ss line), PO_UNIT (its systemd service, if it is
+# safe to stop), PO_DESC (readable) and PO_NOTE (why it cannot be stopped for certbot).
+describe_port() {
     local proc="" pid=""
-    P80_OWNER="$(port_owner 80)" P80_UNIT="" P80_DESC="" P80_NOTE=""
-    [ -n "$P80_OWNER" ] || return 0
-    proc="$(printf '%s' "$P80_OWNER" | grep -o '(("[^"]*"' | head -n1 | cut -d'"' -f2 || true)"
-    pid="$(printf '%s' "$P80_OWNER" | grep -o 'pid=[0-9]*' | head -n1 | cut -d= -f2 || true)"
+    PO_OWNER="$(port_owner "$1")" PO_UNIT="" PO_DESC="" PO_NOTE=""
+    [ -n "$PO_OWNER" ] || return 0
+    proc="$(printf '%s' "$PO_OWNER" | grep -o '(("[^"]*"' | head -n1 | cut -d'"' -f2 || true)"
+    pid="$(printf '%s' "$PO_OWNER" | grep -o 'pid=[0-9]*' | head -n1 | cut -d= -f2 || true)"
     if [ -n "$pid" ]; then
-        P80_UNIT="$(grep -o 'system\.slice/[^/]*\.service' "/proc/$pid/cgroup" 2>/dev/null | head -n1 | cut -d/ -f2 || true)"
+        PO_UNIT="$(grep -o 'system\.slice/[^/]*\.service' "/proc/$pid/cgroup" 2>/dev/null | head -n1 | cut -d/ -f2 || true)"
     fi
-    P80_DESC="${proc:-an unknown process}"
-    if [ -n "$pid" ] && [ -n "$P80_UNIT" ]; then P80_DESC+=" (pid $pid, systemd service $P80_UNIT)"
-    elif [ -n "$pid" ]; then P80_DESC+=" (pid $pid)"
+    PO_DESC="${proc:-an unknown process}"
+    if [ -n "$pid" ] && [ -n "$PO_UNIT" ]; then PO_DESC+=" (pid $pid, systemd service $PO_UNIT)"
+    elif [ -n "$pid" ]; then PO_DESC+=" (pid $pid)"
     fi
-    case "$P80_UNIT" in
+    case "$PO_UNIT" in
         docker.service|containerd.service|podman*.service)
-            P80_NOTE="port 80 is published by a container; stopping $P80_UNIT would stop every container, so stop or move that container yourself"
-            P80_UNIT="" ;;
-        "") P80_NOTE="it is not run by a systemd service, so certbot cannot stop and restart it at each renewal" ;;
+            PO_NOTE="port $1 is published by a container; stopping $PO_UNIT would stop every container, so stop or move that container yourself"
+            PO_UNIT="" ;;
+        "") PO_NOTE="it is not run by a systemd service, so certbot cannot stop and restart it at each renewal" ;;
     esac
 }
 check_webroot_arg() {
@@ -286,41 +305,41 @@ check_webroot_arg() {
 # certbot standalone needs port 80 for a moment at issuance and at every renewal.
 port80_certbot_menu() {
     local opts=() labels=() i choice
-    describe_port80
-    [ -n "$P80_OWNER" ] || return 0
-    interactive || die "certbot needs port 80 for the HTTP-01 challenge, but it is used by $P80_DESC. Use --webroot DIR (that web server's document root, no downtime), --stop-service NAME (stop it during issuance and renewals), or --cert existing / --cert builtin"
-    if [ -n "$P80_UNIT" ]; then
-        opts+=(stop); labels+=("Stop $P80_UNIT only while certbot needs port 80 (issuance and every renewal; certbot starts it again right after)")
+    describe_port 80
+    [ -n "$PO_OWNER" ] || return 0
+    interactive || die "certbot needs port 80 for the HTTP-01 challenge, but it is used by $PO_DESC. Use --webroot DIR (that web server's document root, no downtime), --stop-service NAME (stop it during issuance and renewals), or --cert existing / --cert builtin"
+    if [ -n "$PO_UNIT" ]; then
+        opts+=(stop); labels+=("Stop $PO_UNIT only while certbot needs port 80 (issuance and every renewal; certbot starts it again right after)")
     fi
     opts+=(webroot); labels+=("Let the web server on port 80 answer the challenge from its document root (no downtime; you enter the directory)")
     opts+=(exit); labels+=("I'll free port 80 myself: exit now")
     echo
-    echo "certbot needs port 80 for the HTTP-01 challenge, but it is used by $P80_DESC."
+    echo "certbot needs port 80 for the HTTP-01 challenge, but it is used by $PO_DESC."
     for i in "${!opts[@]}"; do echo "  $((i + 1))) ${labels[$i]}"; done
-    [ -z "$P80_NOTE" ] || echo "  (No stop option: $P80_NOTE.)"
+    [ -z "$PO_NOTE" ] || echo "  (No stop option: $PO_NOTE.)"
     read -r -p "Choose [1-${#opts[@]}] (default ${#opts[@]}): " choice
     choice="${choice:-${#opts[@]}}"
     [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#opts[@]}" ] || die "invalid choice: $choice"
     case "${opts[$((choice - 1))]}" in
-        stop) STOP_SVC="$P80_UNIT"; info "certbot will stop $STOP_SVC while it needs port 80 (it remembers this for renewals)" ;;
+        stop) STOP_SVC="$PO_UNIT"; info "certbot will stop $STOP_SVC while it needs port 80 (it remembers this for renewals)" ;;
         webroot)
             read -r -p "Document root that serves http://$DOMAIN/ (e.g. /var/www/html): " WEBROOT
             check_webroot_arg ;;
-        exit) info "Port 80 is used by $P80_DESC; free it, then run the script again."; exit 1 ;;
+        exit) info "Port 80 is used by $PO_DESC; free it, then run the script again."; exit 1 ;;
     esac
 }
 # Built-in ACME keeps port 80 for itself; offer certbot, which only borrows it.
 port80_builtin_menu() { # $1: why port 80 is needed
     local choice
-    interactive || die "$1, but port 80 is used by $P80_DESC. Free it, or use --cert certbot (with --webroot / --stop-service) or --cert existing"
+    interactive || die "$1, but port 80 is used by $PO_DESC. Free it, or use --cert certbot (with --webroot / --stop-service) or --cert existing"
     echo
-    echo "$1, but port 80 is used by $P80_DESC."
+    echo "$1, but port 80 is used by $PO_DESC."
     echo "  1) Use certbot instead: it needs port 80 only briefly, at issuance and renewals"
     echo "  2) I'll free port 80 myself: exit now"
     read -r -p "Choose [1-2] (default 2): " choice
     case "${choice:-2}" in
         1) CERT_MODE=certbot; CERT_SRC="$LE_LIVE/$DOMAIN/fullchain.pem"; KEY_SRC="$LE_LIVE/$DOMAIN/privkey.pem" ;;
-        2) info "Port 80 is used by $P80_DESC; free it, then run the script again."; exit 1 ;;
+        2) info "Port 80 is used by $PO_DESC; free it, then run the script again."; exit 1 ;;
         *) die "invalid choice: $choice" ;;
     esac
 }
@@ -351,8 +370,8 @@ elif [ "$CERT_MODE" = certbot ]; then
     CERT_SRC="$LE_LIVE/$DOMAIN/fullchain.pem"; KEY_SRC="$LE_LIVE/$DOMAIN/privkey.pem"
 fi
 if [ "$CERT_MODE" = builtin ]; then
-    describe_port80
-    if [ -n "$P80_OWNER" ] && [ "$P80_UNIT" != "$SERVICE.service" ]; then # a re-run finds our own listener
+    describe_port 80
+    if [ -n "$PO_OWNER" ] && [ "$PO_UNIT" != "$SERVICE.service" ]; then # a re-run finds our own listener
         port80_builtin_menu "--cert builtin keeps port 80 open for the ACME HTTP-01 challenge"
     fi
 fi
@@ -386,7 +405,49 @@ PKGS=(ca-certificates curl git xz-utils iproute2 openssl qrencode)
 apt-get install -y -qq --no-install-recommends "${PKGS[@]}" >/dev/null
 
 # ---------- preflight ----------
-check_port_free "$PORT"
+port_nginx_menu() {
+    local choice
+    echo
+    echo "Port $PORT is used by $PO_DESC."
+    echo "  1) Share port $PORT with nginx: TLS connections for $DOMAIN go to Socratex, every other name stays"
+    echo "     with nginx's websites. Each nginx file that needs a change is shown first and changed only with your OK"
+    echo "  2) Use another port for Socratex"
+    echo "  3) Exit"
+    read -r -p "Choose [1-3] (default 3): " choice
+    case "${choice:-3}" in
+        1) NGINX_SNI=1 ;;
+        2) read -r -p "Port for Socratex: " PORT
+           [[ "$PORT" =~ ^[0-9]+$ ]] && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || die "invalid port: $PORT"
+           describe_port "$PORT"
+           [ -z "$PO_OWNER" ] || die "port $PORT is used by $PO_DESC as well" ;;
+        3) info "Free port $PORT or choose another one with --port, then run the script again."; exit 1 ;;
+        *) die "invalid choice: $choice" ;;
+    esac
+}
+if [ "$NGINX_SNI" != 1 ]; then
+    describe_port "$PORT"
+    if [ -n "$PO_OWNER" ] && [ "$PO_UNIT" != "$SERVICE.service" ]; then
+        if [[ "$PO_DESC" == nginx* ]] && interactive; then port_nginx_menu
+        elif [[ "$PO_DESC" == nginx* ]]; then
+            die "port $PORT is used by $PO_DESC. Pass --nginx-sni to share it with nginx by TLS server name (the first time needs a terminal to approve each nginx file change), or --port for another port"
+        else die "port $PORT is already in use by $PO_DESC"
+        fi
+    fi
+fi
+LISTEN_PORT="$PORT"
+if [ "$NGINX_SNI" = 1 ]; then
+    describe_port "$PORT"
+    [ -n "$PO_OWNER" ] && [[ "$PO_DESC" == nginx* ]] || die "--nginx-sni: port $PORT must be served by nginx (it is used by: ${PO_DESC:-nothing})"
+    LISTEN_PORT=""
+    if [ "$OLD_SNI" = 1 ] && [ -n "$OLD_LISTEN_PORT" ]; then LISTEN_PORT="$OLD_LISTEN_PORT"
+    else
+        for p in $(seq 20443 20642); do
+            if [ -z "$(port_owner "$p")" ]; then LISTEN_PORT="$p"; break; fi
+        done
+        [ -n "$LISTEN_PORT" ] || die "no free local port for Socratex between 20443 and 20642"
+    fi
+fi
+check_port_free "$LISTEN_PORT"
 if [ "$CERT_MODE" = certbot ] && [ ! -r "$CERT_SRC" ]; then
     if [ -n "$WEBROOT" ]; then
         # Let's Encrypt fetches http://DOMAIN/.well-known/acme-challenge/<token> and follows
@@ -558,13 +619,34 @@ EOF
     fi
 fi
 
+# ---------- share the port with nginx ----------
+if [ "$NGINX_SNI" = 1 ]; then
+    [ -f "$APP/scripts/nginx_sni.py" ] || die "the deployed revision ($REF) has no scripts/nginx_sni.py; deploy --ref main to share a port with nginx"
+    command -v python3 >/dev/null || apt-get install -y -qq --no-install-recommends python3 >/dev/null
+    install -m 755 "$APP/scripts/nginx_sni.py" "$SNI_TOOL"
+    info "sharing port $PORT with nginx: $DOMAIN -> Socratex on 127.0.0.1:$LISTEN_PORT"
+    rc=0; python3 -I "$SNI_TOOL" add --domain "$DOMAIN" --backend "127.0.0.1:$LISTEN_PORT" --owner "$SERVICE" --port "$PORT" || rc=$?
+    case "$rc" in
+        0) ;;
+        3) die "nginx was left as it is, so Socratex cannot use port $PORT; choose a free port with --port" ;;
+        *) die "port sharing with nginx was not set up (see the message above); nginx was left as it is" ;;
+    esac
+elif [ -f "$SNI_TOOL" ] && grep -qs "\"owner\": \"$SERVICE\"" /etc/sx-sni/state.json; then
+    # Not sharing any more (or an earlier run stopped after adding the route): give nginx the port back.
+    info "Socratex no longer shares port ${OLD_PORT:-$PORT} with nginx"
+    python3 -I "$SNI_TOOL" remove --owner "$SERVICE"
+fi
+
 # ---------- settings ----------
 tmp_env="$(mktemp)"
 cat > "$tmp_env" <<EOF
 SOCRATEX_USER=$P_USER
 SOCRATEX_PASSWORD=$P_PASS
 SOCRATEX_DOMAIN=$DOMAIN
-SOCRATEX_PORT=$PORT
+SOCRATEX_PORT=$LISTEN_PORT
+SOCRATEX_LISTEN_ARGS=$([ "$NGINX_SNI" = 1 ] && echo --address=127.0.0.1 || true)
+DEPLOY_PUBLIC_PORT=$PORT
+DEPLOY_NGINX_SNI=$NGINX_SNI
 SOCRATEX_SECRET_DOMAIN=$SECRET_DOMAIN
 SOCRATEX_EXTRA_ARGS=$EXTRA_ARGS
 SOCRATEX_TLS_ARGS=$TLS_ARGS
@@ -610,7 +692,7 @@ Group=$SERVICE
 EnvironmentFile=$ENV_FILE
 Environment=HOME=$STATE
 WorkingDirectory=$APP
-ExecStart=$NODE main.mjs --domain=\${SOCRATEX_DOMAIN} --port=\${SOCRATEX_PORT} \$SOCRATEX_TLS_ARGS \$SOCRATEX_EXTRA_ARGS
+ExecStart=$NODE main.mjs --domain=\${SOCRATEX_DOMAIN} --port=\${SOCRATEX_PORT} \$SOCRATEX_LISTEN_ARGS \$SOCRATEX_TLS_ARGS \$SOCRATEX_EXTRA_ARGS
 Restart=on-failure
 RestartSec=3
 LimitNOFILE=65535
@@ -648,8 +730,8 @@ fi
 
 # ---------- health check ----------
 info "waiting for the proxy to start"
-for _ in $(seq 1 30); do [ -n "$(port_owner "$PORT")" ] && break; sleep 1; done
-[ -n "$(port_owner "$PORT")" ] || { journalctl -u "$SERVICE" -n 30 --no-pager >&2; die "service did not start listening on $PORT"; }
+for _ in $(seq 1 30); do [ -n "$(port_owner "$LISTEN_PORT")" ] && break; sleep 1; done
+[ -n "$(port_owner "$LISTEN_PORT")" ] || { journalctl -u "$SERVICE" -n 30 --no-pager >&2; die "service did not start listening on $LISTEN_PORT"; }
 sleep 2
 # Connect to this machine for the proxy hostname; credentials go via stdin, not argv.
 check() { curl -s -o /dev/null --max-time 20 --resolve "$DOMAIN:$PORT:127.0.0.1" --proxy "https://$DOMAIN:$PORT" "$@" 2>/dev/null || true; }
@@ -668,7 +750,7 @@ if [ "$deny" = "$expected" ]; then info "health check: unauthenticated request r
 else warn "unauthenticated request returned '$deny', expected $expected"; fi
 
 echo
-info "deployed $REF@$COMMIT on $DOMAIN:$PORT (logs: journalctl -u $SERVICE -f)"
+info "deployed $REF@$COMMIT on $DOMAIN:$PORT$([ "$NGINX_SNI" = 1 ] && echo " (through nginx, Socratex on 127.0.0.1:$LISTEN_PORT; routing: python3 $SNI_TOOL status)" || true) (logs: journalctl -u $SERVICE -f)"
 echo "Also allow inbound TCP $PORT$([ "$CERT_MODE" != existing ] && echo ' and 80') in your cloud provider's security group if it has one."
 echo
 show_links

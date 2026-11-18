@@ -49,7 +49,7 @@ What it does: installs official Node.js 22 (SHA-256 verified) unless Node 22+ is
 
 It finally prints a NaïveProxy share link (`naive+https://…`, also as a QR code) for NekoBox/husi/Exclave/v2rayN, a standard `https://user:pass@host:port` proxy URL, a Clash Meta/mihomo `proxies` entry, and a Shadowrocket import link (`https://user:pass@host:port?peer=host&method=auto&fingerprint=Safari26_3#name`). The naive link format follows the NekoBox and v2rayN parsers. Shadowrocket rejects `naive+https://`; its link format was taken from a node Shadowrocket (macOS) itself exported, and the script's output is byte-identical to that export.
 
-Useful options: `--stealth` (probe resistance; also prints the browser secret link), `--port`, `--user`/`--password`, `--cert existing|certbot|builtin` and `--cert-file`/`--key-file` (see below), `--tune-network` (BBR and TCP buffers), `--ref`, `--name`. Re-running updates the code and keeps credentials; `sudo bash deploy.sh --show` prints the links again; `--uninstall [--purge]` removes it. Tested on Ubuntu 24.04 (arm64, systemd container) with a custom certificate (install, re-run with `--stealth`, `--show`, `--uninstall --purge`), and on a live Debian 12 x64 server that already ran nginx on 80/443: deployed on port 8443 reusing the host's existing Let's Encrypt certificate, upgraded by re-running with no arguments (settings kept), and verified from the public internet with curl and the official naive client over HTTPS (140 downloads; one transient TLS error at the destination). Fresh certificate issuance via certbot standalone has not been exercised yet.
+Useful options: `--stealth` (probe resistance; also prints the browser secret link), `--port`, `--nginx-sni` (share the port with nginx's websites, see below), `--user`/`--password`, `--cert existing|certbot|builtin` and `--cert-file`/`--key-file` (see below), `--tune-network` (BBR and TCP buffers), `--ref`, `--name`. Re-running updates the code and keeps credentials; `sudo bash deploy.sh --show` prints the links again; `--uninstall [--purge]` removes it. Tested on Ubuntu 24.04 (arm64, systemd container) with a custom certificate (install, re-run with `--stealth`, `--show`, `--uninstall --purge`), and on a live Debian 12 x64 server that already ran nginx on 80/443: deployed on port 8443 reusing the host's existing Let's Encrypt certificate, upgraded by re-running with no arguments (settings kept), and verified from the public internet with curl and the official naive client over HTTPS (140 downloads; one transient TLS error at the destination). Fresh certificate issuance via certbot standalone has not been exercised yet.
 
 `main.mjs` also reads `SOCRATEX_USER`, `SOCRATEX_PASSWORD` and `SOCRATEX_SECRET_DOMAIN` from the environment when the matching options are not given.
 
@@ -66,6 +66,53 @@ Both deploy scripts ask on first install (or take `--cert MODE`) where the certi
 Without a choice and without a terminal, `existing` is used when `/etc/letsencrypt/live/DOMAIN/fullchain.pem` exists, otherwise `certbot`. Every file-based certificate must cover the domain, and its private key must match: both are checked before anything is changed, and a failed check leaves the previous settings in place. The sync step re-checks the pair, so a half-written renewal is never installed. When certbot or `builtin` needs port 80 and another program holds it, the script names that program (process, PID and its systemd service). Run in a terminal, it then offers a menu. For certbot the choices are: stop that service only while certbot needs the port (the same as `--stop-service`, offered only for a systemd service and never for `docker.service` / `containerd.service`, since stopping those would stop every container), use the web server's document root (the same as `--webroot`), or exit and free the port yourself. Exit is the default. For `builtin`, which keeps the port permanently, the choices are: switch to certbot, or exit. The script never kills the program: a systemd service would be restarted anyway, and the port would be busy again at the next renewal. Without a terminal, the script stops and names the options as flags. Installs from before this option (`certbot`, or the old `custom`) carry over unchanged.
 
 Tested on the live Debian 12 server: the upgrade from the old modes, `existing` with the default Let's Encrypt path, `existing` with a custom path (the path unit copied a changed certificate and restarted the services; a mismatched key was refused and nothing was restarted), the interactive menu, `builtin` being refused while nginx holds port 80 (nothing changed), and the port-80 menus (nginx was recognised as `nginx.service`; the exit, invalid-input, missing-directory and builtin-to-certbot paths were checked; a webroot that nginx does not serve was refused; a `docker-proxy` listener was recognised as a container and not offered for stopping). The `builtin` configurations pass `sing-box check` and `caddy validate`. **Not yet tested**: actual ACME issuance with `certbot` and `builtin`. That server's ports 80 and 443 belong to nginx, so issuance needs a server where they are free. Socratex's built-in client registers the contact `i@DOMAIN` (hard-coded in utilitas).
+
+### Sharing port 443 with nginx
+
+When nginx already serves websites on the proxy port, `deploy.sh` offers to share the port instead of failing (or pass `--nginx-sni`). nginx's stream module reads the server name (SNI) of each TLS connection without decrypting it: connections for the proxy domain go to Socratex, which now listens on `127.0.0.1:20443` (or the next free port), and every other name goes to nginx's own HTTPS servers, which move to `127.0.0.1:10443`. Clients keep using port 443, and the TLS fingerprint they see is Socratex's own. The proxy needs its own subdomain: one name cannot be split between a website and the proxy.
+
+The work is done by `scripts/nginx_sni.py` (installed as `/usr/local/sbin/sx-nginx-sni`, Python 3 standard library only):
+
+- It parses the configuration nginx actually loads, following `include`, and changes only the files that must change: those with a `listen` on the port, and the main `nginx.conf`, which gets one appended line `include /etc/sx-sni/stream.conf;`. Every other file stays as it is.
+- Each of those files is shown as a diff and changed only after you answer `y` for that file. Declining any file changes nothing at all, which is why the first run needs a terminal.
+- The routing itself lives in a new file, `/etc/sx-sni/stream.conf`.
+- Visitor addresses still reach the websites: the stream block sends the PROXY protocol, and the moved servers get `set_real_ip_from 127.0.0.1; real_ip_header proxy_protocol;`. They also get `port_in_redirect off;`, so the redirects nginx builds itself do not name the local port. Inside those servers `$server_port` (for example FastCGI's `SERVER_PORT`) becomes the local port; `$proxy_protocol_server_port` holds the public one. Socratex only sees `127.0.0.1`, which affects its logs and nothing else.
+- Applying a change takes these steps: backup to `/etc/sx-sni/backup/`, `nginx -t`, reload, then a wait until the new nginx workers serve. Finally each moved website is requested once and its answer is compared with the one before the change. If any step fails, every file is restored and nginx is reloaded with the old configuration.
+- Symlinked files (`sites-enabled/` → `sites-available/`) stay links: the edit goes to the file they point to.
+- Interrupting a change is safe. Ctrl-C and a dropped SSH session are ignored while files are being changed, and if a change does not finish, it is rolled back.
+- Edited lines keep the original text after a `#sx-sni-orig#` marker. `deploy.sh --uninstall` restores exactly those lines and removes the `#sx-sni-added#` line, so other edits made to these files in the meantime survive.
+
+The script refuses, and asks for manual setup, when:
+
+- a `listen` line shares its line with other directives, or one `listen` line is included into several `server` blocks;
+- a site listens on one specific address (`listen 1.2.3.4:443`), or port 443 already receives the PROXY protocol from a load balancer;
+- the proxy domain is one of nginx's own `server_name`s;
+- nginx already has a `stream {}` block of its own;
+- a site uses `real_ip_header` with another source (for example a CDN header);
+- nginx lacks the stream or ssl_preread module;
+- the configuration contains Lua blocks.
+
+Routes can be listed with `python3 /usr/local/sbin/sx-nginx-sni status`.
+
+While the port is shared, a new HTTPS site must not `listen 443` itself. That includes sites added by `certbot --nginx`. Such a site passes `nginx -t`, but the reload cannot bind the port, and the next nginx restart fails. Give a new site `listen 127.0.0.1:10443 ssl proxy_protocol;` instead, or run `deploy.sh` again, which moves it with the same per-file confirmation. `status` names any such line, and the `include` line in `nginx.conf` repeats this rule.
+
+Tested on Debian 12 with nginx 1.29.1, on an nginx instance separate from the production one:
+
+- the parse and plan of a five-file production configuration;
+- declining one file, which changed nothing;
+- applying, routing by SNI, and visitor addresses kept;
+- re-runs, and a second route added without a terminal;
+- each refusal case;
+- removal, after which the files were byte-identical;
+- automatic rollback when the reload could not bind the new port, including Ctrl-C and SIGHUP sent while it waited;
+- a symlinked site file, which stayed a link;
+- the redirect rule;
+- a new domain for the same owner, which replaced the old route;
+- `status` finding a clashing site.
+
+An independent review found the cases covered by the symlink, redirect, PROXY-protocol, address-specific, shared-listen, interruption and route-replacement rules before they shipped.
+
+**Not yet tested**: a complete `deploy.sh` run in this mode on a server where nginx holds 443.
 
 ### AnyTLS, ShadowTLS and NaïveProxy servers
 
